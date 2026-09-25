@@ -515,6 +515,12 @@ followed by an unsigned big-endian u64 Unix timestamp in seconds. Write through
 same-directory staging, fsync, atomic rename and directory fsync, without setting
 mtime. Refresh on opening the store, after successful chunk publication, on clear,
 and best-effort on normal close/error unwinding while both locks are still held.
+On open, always publish the current timestamp. During that store's lifetime,
+serialize timestamp sampling and publication; skip the write only when the sampled
+second equals its last successfully published timestamp. A failed publication
+must not update this remembered value; a changed second, including clock rollback,
+requires a new durable publication. This avoids rewriting identical records without
+changing retention precision or the chunk fsync/rename/directory-fsync ACK boundary.
 A killed process retains its last published timestamp. Activity records do not
 prove chunk validity; always rehash chunks. No filesystem timestamp is used for
 validation or retention, so this works on VFAT without precise timestamp support.

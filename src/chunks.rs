@@ -10,7 +10,7 @@ use std::{
     io::{Read, Seek, Write},
     os::unix::fs::FileExt,
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -166,6 +166,7 @@ pub fn scope(peer: [u8; 16], push: bool, root: &str, path: &str) -> Result<[u8; 
 pub struct Store {
     root: Root,
     description: Description,
+    last_activity: Mutex<u64>,
     _lock: File,
     _cache_lock: File,
 }
@@ -246,10 +247,12 @@ impl Store {
         parent.mkdir(&key)?;
         let root = parent.subtree(&key)?;
         let lock = root.lock_state("lock")?;
-        write_activity(&root, now()?)?;
+        let activity = now()?;
+        write_activity(&root, activity)?;
         Ok(Self {
             root,
             description,
+            last_activity: Mutex::new(activity),
             _lock: lock,
             _cache_lock: cache_lock,
         })
@@ -300,7 +303,7 @@ impl Store {
                 self.description.chunk_hash(index)?,
             )?
             .commit()?;
-        write_activity(&self.root, now()?)
+        self.touch()
     }
     /// Assemble to an anonymous file, verifying chunks and the full digest again.
     /// Installation/mtime/deletion remain the sync engine's responsibility.
@@ -332,8 +335,29 @@ impl Store {
     pub fn clear(&self) -> Result<()> {
         payload_bytes(&self.root)?; // Validate all paths before removal.
         remove_payload(&self.root)?;
-        write_activity(&self.root, now()?)
+        self.touch()
     }
+    fn touch(&self) -> Result<()> {
+        // Serialize timestamp sampling and publication, including concurrent callers.
+        let mut last = self
+            .last_activity
+            .lock()
+            .map_err(|_| Error::Config("cache activity lock poisoned".into()))?;
+        refresh_activity(&mut last, now()?, |time| write_activity(&self.root, time))
+    }
+}
+
+fn refresh_activity(
+    last: &mut u64,
+    seconds: u64,
+    persist: impl FnOnce(u64) -> Result<()>,
+) -> Result<()> {
+    if *last != seconds {
+        persist(seconds)?;
+        // Only a successful durable publication may suppress the next write.
+        *last = seconds;
+    }
+    Ok(())
 }
 
 // Activity is an atomic, fixed-size content record, independent of filesystem mtime.
@@ -407,7 +431,7 @@ fn expire(parent: &Root, current: &str, retention: u64, now: u64) -> Result<()> 
 impl Drop for Store {
     fn drop(&mut self) {
         // Both locks are still held. Failed/aborted transfers get a fresh grace period.
-        if let Err(error) = now().and_then(|time| write_activity(&self.root, time)) {
+        if let Err(error) = self.touch() {
             tracing::warn!(%error, "could not update cache activity on close");
         }
     }
@@ -466,4 +490,43 @@ fn remove_payload(root: &Root) -> Result<()> {
         root.remove_files("", &staging)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+
+    #[test]
+    fn identical_activity_is_reused_but_clock_changes_are_persisted() {
+        let mut last = 100;
+        let mut writes = Vec::new();
+        for time in [100, 100, 101, 101, 99, 99, 100] {
+            refresh_activity(&mut last, time, |value| {
+                writes.push(value);
+                Ok(())
+            })
+            .unwrap();
+        }
+        assert_eq!(writes, [101, 99, 100]);
+        assert_eq!(last, 100);
+    }
+
+    #[test]
+    fn failed_activity_publication_is_retried() {
+        let mut last = 100;
+        let error = refresh_activity(&mut last, 101, |_| {
+            Err(std::io::Error::other("injected publication failure").into())
+        });
+        assert!(error.is_err());
+        assert_eq!(last, 100);
+        let mut retried = false;
+        refresh_activity(&mut last, 101, |value| {
+            assert_eq!(value, 101);
+            retried = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(retried);
+        assert_eq!(last, 101);
+    }
 }

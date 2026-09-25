@@ -165,7 +165,9 @@ background timer: an idle cache is left alone, and dry-run never cleans it. The
 currently requested transfer is retained and its chunks are verified for resume.
 
 Activity is recorded atomically in file contents on open, successful chunk receipt,
-clear and normal close. It does not depend on filesystem timestamps, including on
+clear and normal close. Events within the same Unix second reuse the store's
+already durable activity record; each received chunk is still synchronized before
+acknowledgment. Activity does not depend on filesystem timestamps, including on
 VFAT. Missing or malformed records get a full retention period on discovery;
 future timestamps are retained until the clock catches up. A forward clock jump
 can expire inactive cache early, requiring those bytes to be transferred again.
