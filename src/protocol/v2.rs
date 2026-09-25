@@ -1,4 +1,4 @@
-//! Chunk-transfer codec. Not yet enabled by the Reticulum adapter or sync engine.
+//! Chunk-transfer codec used by engine::v2; not yet enabled by the Reticulum adapter.
 //! Version and request path are distinct from v1; legacy file commands are rejected.
 use super::{MAX_CONTROL, Reader, Writer};
 use crate::{
@@ -66,7 +66,7 @@ fn common_tag(tag: u8) -> bool {
 }
 
 /// Check a MISSING reply against its agreed description, before sending data.
-/// Used by both the encoder and the future session coordinator.
+/// Used by both the encoder and the session coordinator.
 pub fn validate_missing(chunks: &[u32], count: usize) -> Result<()> {
     if count > MAX_CHUNKS || chunks.len() > count {
         return Err(invalid("missing chunk count outside bound"));

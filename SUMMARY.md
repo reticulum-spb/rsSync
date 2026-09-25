@@ -4,7 +4,8 @@ This document describes the Reticulum interaction and application wire protocol
 for an independent Python implementation. Protocol version 1 is implemented by the
 Rust client and server. Filesystem operations remain the responsibility of each
 implementation; native Reticulum delivers encrypted, verified Resources.
-The final v2 section describes a tested codec that is not yet enabled on the wire.
+The final v2 section describes a tested codec and engine that are not yet enabled
+in the Reticulum adapter or CLI.
 
 ## Runtime, identity and destination
 
@@ -282,13 +283,14 @@ These mappings describe the intended Python port; interoperability with a Python
 rrsync implementation has not yet been tested. The currently validated peers are
 Rust client/server processes attached to the existing rnsd-rs shared instance.
 
-## Version 2 chunk extension — codec only, not served yet
+## Version 2 chunk extension — engine implemented, not served yet
 
-The Rust library includes a bounded v2 codec in `src/protocol/v2.rs`. The active
-CLI, engine and Reticulum request handler still use v1 exclusively. Do not send
+The Rust library includes a bounded v2 codec in `src/protocol/v2.rs` and client/server
+state machines in `src/engine/v2.rs`, verified over a simulated file transport.
+The active CLI and Reticulum request handler still use v1 exclusively. Do not send
 these messages to the current server or assume that chunk resume is available.
-This section fixes the encoding for the next integration stage; the state machine
-and capability selection described below still need implementation and testing.
+This section fixes the encoding and engine behavior for transport integration.
+Capability selection and native Reticulum integration still need implementation.
 
 V2 uses a distinct request path `/rrsync/v2` and header `version:u8 = 2, tag:u8`.
 The destination remains `rrsync.sync`. Never send v2 on `/rrsync/v1`, mix versions
@@ -346,7 +348,7 @@ count. Empty means all chunks are available, including for an empty file. The
 codec enforces its absolute bounds; a sender must additionally validate MISSING
 against its own description before transmitting anything.
 
-### Required v2 transfer ordering
+### V2 transfer ordering
 
 After START/MANIFEST, each pending file is handled sequentially. Only one chunk
 Resource may be outstanding. Full/read/deny authorization and dry-run behavior
@@ -394,6 +396,21 @@ Changed identities, paths, source bytes or chunk sizes must not accidentally reu
 another transfer's state. A lost chunk or file acknowledgement is resolved by
 fresh negotiation, not blind mutation replay. Receiver-state quotas, retention,
 configuration and automatic reconnect are still pending integration.
+
+The engine receives authenticated peer identity and current permission from its
+adapter on every request. An identity change or revoked write permission aborts
+the owning session. Requests from another connection cannot release the active
+session. One described file and one pending chunk are allowed; repeated BEGIN,
+COMMIT or verification commands in the wrong state are rejected. File completion
+cannot proceed while a chunk is pending; push additionally requires all missing
+chunks to have been persisted. Pull permits FILE_VERIFIED without CHUNK_GET when
+the receiver already has every chunk in its verified cache.
+
+An error or disconnect releases pending files and cache locks while preserving
+committed chunks. Lost close notifications rely on the inactivity lease; native
+traffic should refresh it as in v1. Successful installation triggers best-effort
+chunk eviction. Eviction failure is logged and does not undo file installation or
+turn its acknowledgement into a failure. Empty cache lock directories remain.
 
 ### Fixed v2 encoding examples
 

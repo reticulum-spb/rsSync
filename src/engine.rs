@@ -1,4 +1,5 @@
 //! Transport-independent synchronization state and orchestration.
+pub mod v2;
 use crate::{
     Error, Result,
     config::Permission,
