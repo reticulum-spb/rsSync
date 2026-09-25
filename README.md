@@ -93,7 +93,8 @@ resume:
 
 The client selects `chunk_size` for both directions. It is required and has no
 default; the example uses 1 MiB. Allowed sizes
-are 4 KiB–16 MiB, with at most 8,192 chunks per file. Choose a size appropriate for
+are 4 KiB–16 MiB. The file limit is 134,217,727 bytes regardless of chunk size;
+4 KiB chunks can therefore cover 32,768 chunks in one file. Choose a size appropriate for
 your link; no universally optimal size is assumed. `directory` defaults to
 `transfers`, relative to the application configuration directory; an absolute path
 is also accepted. It must be outside the synchronized tree and cannot contain it.
@@ -109,7 +110,15 @@ and requests only missing or damaged ones. Changed source content, chunk size,
 peer identity or path starts separate state. Every received block and the assembled
 file are checked with SHA-256, including when `--checksum` is absent. The flag
 still controls the initial comparison of existing files. Logs report cached and
-missing chunk counts per file. Delta transfer is not implemented.
+missing chunk counts per page. Hashes and missing indices are negotiated in pages
+of at most 128 chunks; the full hash table is kept in an anonymous temporary file,
+not an in-memory vector. Each cache subdirectory holds at most 256 chunk payloads.
+Smaller chunks reduce retransmission after interruption but increase hashing,
+control exchanges and disk operations. Delta transfer is not implemented.
+
+Both peers must use the current paged v2 format. There is no unpaged-v2 fallback
+or old-cache migration. Stop cache users and clear the old `resume.directory`
+contents before upgrading from the flat cache format.
 
 To reconnect automatically, add this top-level section to the client config
 (requires `protocol: 2`):
@@ -139,7 +148,7 @@ the existing runtime; daemon restart recovery has not been tested.
 
 `max_bytes` defaults to 512 MiB and limits logical cached payload/staging bytes,
 reserving room for the missing blocks of each incoming file. It excludes filesystem
-allocation overhead, lock/activity records, native Resource temporary files and assembled snapshots.
+allocation overhead, lock/activity records, native Resource temporary files, temporary hash tables and assembled snapshots.
 `max_transfers` defaults to 128 and limits retained transfer directories, including
 empty lock directories after successful transfers. Both limits must be positive;
 `max_transfers` must be below 16,384. Exceeding a limit fails without evicting other

@@ -8,22 +8,24 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::File,
     io::{Read, Seek, Write},
+    os::unix::fs::FileExt,
     path::Path,
+    sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 // Safety bounds, not a default or performance recommendation.
 pub const MIN_CHUNK_SIZE: u32 = 4096;
 pub const MAX_CHUNK_SIZE: u32 = 16 * 1024 * 1024;
-// Leave room for the lock and abandoned staging files below Root's entry limit.
-pub const MAX_CHUNKS: usize = 8192;
+pub const PAGE_CHUNKS: usize = 128;
+pub const SHARD_CHUNKS: usize = 256;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub struct Description {
     size: u64,
     chunk_size: u32,
     hash: [u8; 32],
-    hashes: Vec<[u8; 32]>,
+    hashes: Arc<File>,
 }
 impl Description {
     /// Validate geometry before allocating a hash table from peer input.
@@ -32,15 +34,14 @@ impl Description {
             return Err(Error::Protocol("chunk size outside safety bounds".into()));
         }
         let count = size.div_ceil(u64::from(chunk_size));
-        if count > MAX_CHUNKS as u64 {
+        if size > crate::sync::MAX_FILE || count > u32::MAX as u64 {
             return Err(Error::Protocol("chunk count limit exceeded".into()));
         }
         Ok(count as usize)
     }
-    pub fn new(size: u64, chunk_size: u32, hash: [u8; 32], hashes: Vec<[u8; 32]>) -> Result<Self> {
-        if hashes.len() != Self::count(size, chunk_size)? {
-            return Err(Error::Protocol("chunk hash count mismatch".into()));
-        }
+    /// Header only; pages are negotiated into an anonymous disk-backed hash table.
+    pub fn header(size: u64, chunk_size: u32, hash: [u8; 32]) -> Result<Self> {
+        Self::count(size, chunk_size)?;
         if size == 0 && hash != <[u8; 32]>::from(Sha256::digest([])) {
             return Err(Error::HashMismatch("empty chunk description".into()));
         }
@@ -48,16 +49,45 @@ impl Description {
             size,
             chunk_size,
             hash,
-            hashes,
+            hashes: Arc::new(tempfile::tempfile()?),
         })
+    }
+    pub fn chunks(&self) -> usize {
+        Self::count(self.size, self.chunk_size).unwrap()
+    }
+    pub fn page_len(&self, start: usize) -> Result<usize> {
+        if start >= self.chunks() || !start.is_multiple_of(PAGE_CHUNKS) {
+            return Err(Error::Protocol("invalid hash page offset".into()));
+        }
+        Ok((self.chunks() - start).min(PAGE_CHUNKS))
+    }
+    pub fn set_page(&self, start: usize, hashes: &[[u8; 32]]) -> Result<()> {
+        if hashes.len() != self.page_len(start)? {
+            return Err(Error::Protocol("invalid hash page length".into()));
+        }
+        for (i, hash) in hashes.iter().enumerate() {
+            self.hashes.write_all_at(hash, ((start + i) as u64) * 32)?;
+        }
+        Ok(())
+    }
+    pub fn chunk_hash(&self, index: usize) -> Result<[u8; 32]> {
+        self.length(index)?;
+        let mut hash = [0; 32];
+        self.hashes.read_exact_at(&mut hash, index as u64 * 32)?;
+        Ok(hash)
+    }
+    pub fn page(&self, start: usize) -> Result<Vec<[u8; 32]>> {
+        (start..start + self.page_len(start)?)
+            .map(|i| self.chunk_hash(i))
+            .collect()
     }
     /// Read an existing file/snapshot with a fixed 64 KiB buffer.
     pub fn scan(file: &mut File, chunk_size: u32) -> Result<Self> {
         let before = Stamp::of(&file.metadata()?);
-        let count = Self::count(before.size, chunk_size)?;
+        Self::count(before.size, chunk_size)?;
         file.rewind()?;
         let mut whole = Sha256::new();
-        let mut hashes = Vec::with_capacity(count);
+        let mut hashes = tempfile::tempfile()?;
         let mut buf = [0u8; 65_536];
         let mut remaining = before.size;
         while remaining > 0 {
@@ -71,14 +101,19 @@ impl Description {
                 whole.update(&buf[..n]);
                 left -= n as u64;
             }
-            hashes.push(chunk.finalize().into());
+            hashes.write_all(&chunk.finalize())?;
             remaining -= length;
         }
         if file.read(&mut buf[..1])? != 0 || Stamp::of(&file.metadata()?) != before {
             return Err(Error::Changed("chunk source".into()));
         }
         file.rewind()?;
-        Self::new(before.size, chunk_size, whole.finalize().into(), hashes)
+        Ok(Self {
+            size: before.size,
+            chunk_size,
+            hash: whole.finalize().into(),
+            hashes: Arc::new(hashes),
+        })
     }
     pub fn size(&self) -> u64 {
         self.size
@@ -89,25 +124,19 @@ impl Description {
     pub fn hash(&self) -> [u8; 32] {
         self.hash
     }
-    pub fn hashes(&self) -> &[[u8; 32]] {
-        &self.hashes
-    }
     pub fn length(&self, index: usize) -> Result<u64> {
-        if index >= self.hashes.len() {
+        if index >= self.chunks() {
             return Err(Error::Protocol("chunk index out of range".into()));
         }
         Ok((self.size - index as u64 * u64::from(self.chunk_size)).min(u64::from(self.chunk_size)))
     }
     fn key(&self, scope: [u8; 32]) -> String {
         let mut digest = Sha256::new();
-        digest.update(b"rrsync-local-chunks-v1\0");
+        digest.update(b"rrsync-local-chunks-paged\0");
         digest.update(scope);
         digest.update(self.size.to_be_bytes());
         digest.update(self.chunk_size.to_be_bytes());
         digest.update(self.hash);
-        for hash in &self.hashes {
-            digest.update(hash);
-        }
         hex::encode(digest.finalize())
     }
 }
@@ -177,16 +206,9 @@ impl Store {
             }
             transfers += 1;
             found |= name == key;
-            for (child, meta) in root.children(&name)? {
-                if !meta.is_file() {
-                    return Err(Error::Config("unsupported object in chunk cache".into()));
-                }
-                if child != "lock" && child != "activity" {
-                    bytes = bytes
-                        .checked_add(meta.len())
-                        .ok_or_else(|| Error::Config("cache size overflow".into()))?;
-                }
-            }
+            bytes = bytes
+                .checked_add(payload_bytes(&root.subtree(&name)?)?)
+                .ok_or_else(|| Error::Config("cache size overflow".into()))?;
         }
         if transfers + usize::from(!found) > limits.max_transfers || bytes > limits.max_bytes {
             return Err(Error::Config(
@@ -194,12 +216,16 @@ impl Store {
             ));
         }
         let store = Self::open_locked(&root, scope, description, lock)?;
-        let needed = store
-            .missing()?
-            .into_iter()
-            .try_fold(0u64, |sum, i| -> Result<u64> {
-                Ok(sum + store.description.length(i)?)
-            })?;
+        // Reserve absent/wrong-size chunks before their hashes are negotiated.
+        // Existing bytes are already included above, including corrupt chunks.
+        let mut needed = 0;
+        for i in 0..store.description.chunks() {
+            let name = store.name(i)?;
+            let length = store.description.length(i)?;
+            if !store.root.exists(&name)? || store.root.metadata(&name)?.len() != length {
+                needed += length;
+            }
+        }
         if needed > limits.max_bytes - bytes {
             return Err(Error::Config("chunk cache byte quota exceeded".into()));
         }
@@ -230,7 +256,7 @@ impl Store {
     }
     fn name(&self, index: usize) -> Result<String> {
         self.description.length(index)?;
-        Ok(format!("{index:08x}.chunk"))
+        Ok(format!("{:08x}/{index:08x}.chunk", index / SHARD_CHUNKS))
     }
     /// Wrong size/hash is treated as missing. Unsafe paths and I/O errors fail closed.
     fn verified(&self, index: usize) -> Result<Option<File>> {
@@ -243,15 +269,19 @@ impl Store {
             Err(error) => return Err(error),
         };
         if file.metadata()?.len() != self.description.length(index)?
-            || hash_file(&mut file)? != self.description.hashes[index]
+            || hash_file(&mut file)? != self.description.chunk_hash(index)?
         {
             return Ok(None);
         }
         Ok(Some(file))
     }
-    pub fn missing(&self) -> Result<Vec<usize>> {
+    pub fn missing(&self, start: usize) -> Result<Vec<usize>> {
+        if self.description.chunks() == 0 && start == 0 {
+            return Ok(vec![]);
+        }
+        let count = self.description.page_len(start)?;
         let mut missing = Vec::new();
-        for index in 0..self.description.hashes.len() {
+        for index in start..start + count {
             if self.verified(index)?.is_none() {
                 missing.push(index);
             }
@@ -261,12 +291,13 @@ impl Store {
     /// Publish only after exact length/hash verification and fsync; duplicates are safe.
     pub fn receive(&self, index: usize, reader: &mut impl Read) -> Result<()> {
         let name = self.name(index)?;
+        self.root.mkdir(name.split_once('/').unwrap().0)?;
         self.root
             .stage_content(
                 &name,
                 reader,
                 self.description.length(index)?,
-                self.description.hashes[index],
+                self.description.chunk_hash(index)?,
             )?
             .commit()?;
         write_activity(&self.root, now()?)
@@ -277,7 +308,7 @@ impl Store {
         let mut result = tempfile::tempfile()?;
         let mut whole = Sha256::new();
         let mut buf = [0u8; 65_536];
-        for index in 0..self.description.hashes.len() {
+        for index in 0..self.description.chunks() {
             let mut file = self
                 .verified(index)?
                 .ok_or_else(|| Error::HashMismatch(format!("missing or damaged chunk {index}")))?;
@@ -299,17 +330,8 @@ impl Store {
     /// Explicit eviction under the transfer lock, also removing abandoned staging files.
     /// Keep the lock inode and directory so another owner cannot bypass flock.
     pub fn clear(&self) -> Result<()> {
-        for (name, metadata) in self.root.children("")? {
-            if name == "lock" || name == "activity" {
-                continue;
-            }
-            let chunk_name = name
-                .strip_suffix(".chunk")
-                .is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()));
-            if metadata.is_file() && (chunk_name || name.starts_with(".rrsync-")) {
-                self.root.remove(&name, false)?;
-            }
-        }
+        payload_bytes(&self.root)?; // Validate all paths before removal.
+        remove_payload(&self.root)?;
         write_activity(&self.root, now()?)
     }
 }
@@ -363,19 +385,7 @@ fn expire(parent: &Root, current: &str, retention: u64, now: u64) -> Result<()> 
         }
         let root = parent.subtree(&name)?;
         let _lock = root.lock_state("lock")?;
-        let entries = root.children("")?;
-        // Validate the entire directory before deleting any of its contents.
-        if entries.iter().any(|(name, meta)| {
-            !meta.is_file()
-                || !(name == "lock"
-                    || name == "activity"
-                    || chunk_name(name)
-                    || name.starts_with(".rrsync-"))
-        }) {
-            return Err(Error::Config(
-                "unexpected object in expiring chunk cache".into(),
-            ));
-        }
+        payload_bytes(&root)?; // Validate the whole transfer before any deletion.
         let Some(last) = read_activity(&root)? else {
             tracing::warn!(transfer=%name, "missing or invalid cache activity; starting retention period");
             write_activity(&root, now)?;
@@ -385,11 +395,7 @@ fn expire(parent: &Root, current: &str, retention: u64, now: u64) -> Result<()> 
         if now.checked_sub(last).is_none_or(|age| age < retention) {
             continue;
         }
-        for (child, _) in &entries {
-            if child != "lock" && child != "activity" {
-                root.remove(child, false)?;
-            }
-        }
+        remove_payload(&root)?;
         // Remove the activity record last so interrupted cleanup can be resumed.
         root.remove("activity", false)?;
         root.remove("lock", false)?;
@@ -405,4 +411,52 @@ impl Drop for Store {
             tracing::warn!(%error, "could not update cache activity on close");
         }
     }
+}
+
+fn shard_name(name: &str) -> bool {
+    name.len() == 8 && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+// One directory listing at a time; no tree-sized list of chunk paths in memory.
+fn payload_bytes(root: &Root) -> Result<u64> {
+    let mut bytes = 0u64;
+    for (name, meta) in root.children("")? {
+        if meta.is_file() && (name == "lock" || name == "activity") {
+            continue;
+        }
+        if meta.is_file() && name.starts_with(".rrsync-") {
+            bytes += meta.len();
+            continue;
+        }
+        if !meta.is_dir() || !shard_name(&name) {
+            return Err(Error::Config("unexpected object in chunk cache".into()));
+        }
+        let shard = u32::from_str_radix(&name, 16).unwrap() as usize;
+        for (child, meta) in root.children(&name)? {
+            let valid = chunk_name(&child)
+                && usize::from_str_radix(&child[..8], 16).unwrap() / SHARD_CHUNKS == shard;
+            if !meta.is_file() || !(valid || child.starts_with(".rrsync-")) {
+                return Err(Error::Config("unexpected object in chunk shard".into()));
+            }
+            bytes = bytes
+                .checked_add(meta.len())
+                .ok_or_else(|| Error::Config("cache size overflow".into()))?;
+        }
+    }
+    Ok(bytes)
+}
+fn remove_payload(root: &Root) -> Result<()> {
+    for (name, meta) in root.children("")? {
+        if name == "lock" || name == "activity" {
+            continue;
+        }
+        if meta.is_dir() {
+            for (child, _) in root.children(&name)? {
+                root.remove(&format!("{name}/{child}"), false)?;
+            }
+            root.remove(&name, true)?;
+        } else {
+            root.remove(&name, false)?;
+        }
+    }
+    Ok(())
 }

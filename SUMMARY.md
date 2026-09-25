@@ -311,83 +311,92 @@ still 8 MiB and manifest limits, including the 134,217,727-byte whole-file limit
 remain unchanged for this extension. Native Resource segmentation is still owned
 by Reticulum; an application chunk is one ordinary standalone Resource.
 
+The paged format replaces the previous unpaged v2 format in place. Both peers
+must be upgraded; there is no old decoder, negotiation or compatibility fallback.
+
 | Tag | Message | Fields after tag |
 | --- | --- | --- |
 | 10 | DESCRIBE | `index:u32`, `chunk_size:u32` |
-| 11 | DESCRIPTION | `index:u32`, `description` |
-| 12 | MISSING | `index:u32`, `count:u32`, `chunk:u32` repeated `count` times |
+| 11 | DESCRIPTION | `index:u32`, `size:u64`, `chunk_size:u32`, `whole_sha256:32 bytes` |
+| 12 | MISSING | `index:u32`, `start:u32`, `page_count:u32`, `missing_count:u32`, `chunk:u32` repeated `missing_count` times |
 | 13 | CHUNK_BEGIN | `index:u32`, `chunk:u32` |
 | 14 | CHUNK_COMMIT | `index:u32`, `chunk:u32`, `resource_hash:32 bytes` |
 | 15 | CHUNK_GET | `index:u32`, `chunk:u32` |
 | 16 | CHUNK_VERIFIED | `index:u32`, `chunk:u32` |
 | 17 | FILE_COMMIT | `index:u32` |
 | 18 | FILE_VERIFIED | `index:u32` |
+| 19 | HASHES_GET | `index:u32`, `start:u32` |
+| 20 | HASHES | `index:u32`, `start:u32`, `count:u32`, `chunk_sha256:32 bytes` repeated `count` times |
 
-`index` identifies a file entry in the source manifest, with the same indexing as
-v1, and must be less than 16,384. The session must additionally require that the
-entry is a pending file in its plan. `chunk` is a zero-based index in that file's
-agreed description. Its absolute codec bound is 8,192, exclusive; the session must
-also check it against the actual chunk count.
+`index` identifies a pending file entry in the source manifest and must be less
+than 16,384. `chunk` is an absolute zero-based u32 index within that file, not a
+page-relative index. Check its range against the negotiated page and description
+in the session. There is no independent 8,192-chunk limit.
 
-A `description` is:
+DESCRIPTION is only the file header: no chunk count or table follows its hash.
+Derive `chunk_count = ceil(size / chunk_size)`. `chunk_size` is 4,096–16,777,216
+bytes, explicitly configured, and `size` must not exceed 134,217,727. Thus even
+4 KiB chunks support the full current file limit (32,768 chunks). All chunks except
+the last have exactly `chunk_size` bytes; the last holds the remainder or a full
+chunk when division is exact. Empty files have zero chunks and SHA-256(empty).
+Manifest size and optional checksum must match the header. Hashes cover original
+uncompressed content, not native Resource framing.
 
-```text
-size:u64
-chunk_size:u32
-whole_sha256:32 bytes
-chunk_count:u32
-chunk_sha256:32 bytes repeated chunk_count times
-```
+Hash pages have fixed boundaries: `start` must be a multiple of 128, strictly
+below `chunk_count`, with `count = min(128, chunk_count - start)`. Negotiate pages
+in increasing order starting at zero, without gaps or repetition. Check count and
+available bytes before allocating; a HASHES message is at most 4,110 bytes. Codec
+checks page alignment/count/overflow; the session additionally checks exact geometry
+and expected offset. MISSING must echo the page's index, start and count. Its
+indices are strictly increasing, unique and inside `[start, start + page_count)`;
+empty means that entire page is already cached. MISSING is at most 530 bytes.
+No empty hash pages are sent, including for empty files.
 
-`chunk_size` must be between 4,096 and 16,777,216 bytes inclusive. These are safety
-bounds, not a performance recommendation; no default has been selected.
-`chunk_count = ceil(size / chunk_size)` and must not exceed 8,192. Check geometry,
-limits and available payload bytes before allocating the hash list. All chunks
-except the last have exactly `chunk_size` bytes. The last contains the remainder,
-or `chunk_size` when the division is exact. An empty file has zero chunks and the
-SHA-256 of empty bytes. Hashes are SHA-256 of original uncompressed content, never
-native Resource hashes. The source manifest size must match the description and
-its checksum, when present, must match `whole_sha256`.
-
-MISSING indices must be strictly increasing, unique and below the agreed chunk
-count. Empty means all chunks are available, including for an empty file. The
-codec enforces its absolute bounds; a sender must additionally validate MISSING
-against its own description before transmitting anything.
+The Rust source computes SHA-256 with a fixed buffer and streams chunk hashes to
+an anonymous temporary file. Receivers write negotiated pages to their own anonymous
+hash table. At most one page of hashes/missing indices and one pending Resource
+are needed in memory. Completed page state is discarded; the disk hash table is
+used again during final validation. It costs 32 bytes per chunk (at most 1 MiB with
+the current limits) and is not persistent resume evidence. Python implementations
+can use the same approach; do not accumulate all pages in a list or set.
 
 ### V2 transfer ordering
 
-After START/MANIFEST, each pending file is handled sequentially. Only one chunk
-Resource may be outstanding. Full/read/deny authorization and dry-run behavior
-remain the same as v1; dry-run goes directly from manifest planning to FINISH.
+After START/MANIFEST, handle pending files sequentially. Permissions and dry-run
+remain as in v1; dry-run goes directly from planning to FINISH.
 
 For push:
 
-1. The client snapshots the source and sends DESCRIPTION. The server validates
-   it, opens receiver state bound to the authenticated identity and destination,
-   rehashes cached chunks and replies MISSING.
-2. For each missing chunk, the client sends CHUNK_BEGIN and waits for OK, then
-   sends the exact chunk as a Resource without metadata. The receiver admits only
-   the pending chunk's exact size on the owning Link.
-3. The client sends CHUNK_COMMIT with the completed Resource hash. The server must
-   bind that receipt to the pending file/chunk, verify size and SHA-256, persist
-   the chunk and return OK only after successful publication and fsync. A native
-   Resource proof alone does not mean the chunk is durably cached.
-4. The client checks its source and sends FILE_COMMIT. The server revalidates and
-   assembles all chunks, verifies the whole hash and installs the file before OK.
-   This is the file completion boundary; chunk receipts never mark a file done.
+1. Snapshot the source; send DESCRIPTION. The server validates the header, opens
+   scoped receiver state and replies OK, without an unpaged missing list.
+2. Send HASHES for the next page. The server validates its sequence/geometry,
+   rehashes cached chunks in that page and returns MISSING for that page only.
+3. For each missing index, send CHUNK_BEGIN, wait for OK, send the exact bytes as
+   one Resource without metadata, then send CHUNK_COMMIT with its native Resource
+   hash. The server binds the receipt to that pending chunk, verifies size/SHA-256,
+   publishes and fsyncs the payload before OK. Resource proof alone is insufficient.
+4. Finish every missing chunk before the next HASHES. After all pages, check the
+   source and send FILE_COMMIT. The server revalidates all chunks, assembles and
+   verifies the whole hash, installs the file, then replies OK. Early FILE_COMMIT
+   or a next page while a chunk remains missing/pending is rejected.
 
 For pull:
 
-1. The client sends DESCRIBE with an explicit chunk size. The server snapshots the
-   source and replies DESCRIPTION, keeping that snapshot for chunk reads. The
-   client validates the description and rehashes its local receiver state.
-2. For each locally missing chunk, the client sends CHUNK_GET. The server delivers
-   OK before starting the chunk Resource. The client verifies and persists it,
-   then sends CHUNK_VERIFIED and waits for OK before requesting another chunk.
-3. After full assembly and whole-hash verification, the client sends FILE_VERIFIED.
-   The server must check that its source remains unchanged before replying OK.
-   The client then installs the assembled file. This follows v1's source-check
-   boundary; loss of the reply must prevent local installation on that run.
+1. Send DESCRIBE with the chunk size. The server snapshots the source and returns
+   DESCRIPTION, retaining the snapshot and its disk hash table. Validate the header
+   and open local scoped receiver state.
+2. Send HASHES_GET for the next page. Validate the HASHES response's index, start
+   and exact count; store its hashes and rehash local chunks in that page.
+3. For each missing chunk, send CHUNK_GET. The server replies OK before advertising
+   the Resource. Verify and persist it, then send CHUNK_VERIFIED and wait for OK.
+   Requests outside the current page or repeated indices are rejected.
+4. Request the next page only after all current chunk receipts. After negotiating
+   every page, assemble and verify the whole file, then send FILE_VERIFIED. The
+   server checks its source is unchanged before OK; only then install locally.
+   Early FILE_VERIFIED and changing pages with an outstanding Resource are rejected.
+
+Empty files skip page exchange but still use DESCRIPTION and the appropriate
+FILE_COMMIT/FILE_VERIFIED boundary. All-cached files still negotiate every page.
 
 FINISH remains responsible for successful session completion and extra-file
 removal, never individual chunk commits. Empty/all-cached files still require the
@@ -457,11 +466,13 @@ Dry-run must not create a cache or acquire persistent cache locks.
 
 The default limits are `max_bytes: 536870912` and `max_transfers: 128`. Under an
 exclusive cache-wide lock, count existing payload/staging bytes and reserve the
-space needed for missing chunks before accepting new data. Reject quota violations
+space needed for absent/wrong-size chunks before accepting new data. Existing
+bytes are counted even if later hash checks require replacement. Hash validation
+happens when each page arrives; quotas never imply cache validity. Reject quota violations
 without deleting another transfer's data. An additional per-transfer lock protects
 the individual description. Hold both until file completion or session teardown;
 process termination releases them. The byte limit excludes native Resource and
-assembly/snapshot temporary storage, lock/activity records and filesystem allocation overhead.
+assembly/snapshot/hash-table temporary storage, lock/activity records and filesystem allocation overhead.
 
 Directory-count limits include retained empty lock directories. Successful file
 installation evicts its chunks. `resume.retention_seconds` defaults to 604800;
@@ -496,11 +507,20 @@ time and granted a full retention period (including legacy caches). Retain futur
 timestamps after clock rollback. Expire when `now >= last` and `now - last >=
 retention_seconds`. A forward clock jump can evict inactive state early; content
 must then be retransferred. Before deletion validate all entries in that transfer:
-regular `lock`, `activity`, eight-hex-digit `.chunk` names, or `.rrsync-` staging
-files only. Delete payload/staging first, activity next, lock last, then the empty
+regular `lock`/`activity`, `.rrsync-` staging files, and eight-hex-digit shard
+directories only. Shard `hex8(chunk_index / 256)` contains `hex8(chunk_index).chunk`
+and staging files; verify each chunk belongs to that shard. Validate one directory
+at a time, without collecting all chunk paths. Delete shard payload/staging and
+empty shards first, activity next, lock last, then the empty
 directory, syncing each removal. Interrupted cleanup is safe to revisit; if the
 activity record was already removed, grant a new retention period. Manual cleanup
 still requires all cache users to be stopped.
+
+Transfer directories are keyed by SHA-256 of `rrsync-local-chunks-paged\0`, the
+32-byte scope digest, size:u64, chunk_size:u32 and whole_sha256 (big-endian fields).
+The per-chunk hash table is freshly negotiated and is not part of this key. Chunks
+are rehashed against it before reuse. Flat cache layout is unsupported: stop users
+and clear old state before upgrading. There is no migration implementation.
 
 ### Fixed v2 encoding examples
 
@@ -511,11 +531,14 @@ are for readability and are not transmitted.
 DESCRIBE(index=7, chunk_size=4096):
 020a0000000700001000
 
-MISSING(index=7, chunks=[0,2,6]):
-020c0000000700000003000000000000000200000006
+HASHES_GET(index=7, start=128):
+02130000000700000080
 
-CHUNK_GET(index=7, chunk=2):
-020f0000000700000002
+MISSING(index=7, start=128, page_count=3, chunks=[128,130]):
+020c000000070000008000000003000000020000008000000082
+
+CHUNK_GET(index=7, chunk=32767):
+020f0000000700007fff
 
 FILE_COMMIT(index=7):
 021100000007
@@ -523,6 +546,8 @@ FILE_COMMIT(index=7):
 DESCRIPTION(index=7, content="hello", chunk_size=4096):
 020b00000007000000000000000500001000
 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
-00000001
+
+HASHES(index=7, start=0, hashes=[SHA256("hello")]):
+0214000000070000000000000001
 2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824
 ```

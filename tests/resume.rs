@@ -28,6 +28,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(push: bool) -> Self {
+        Self::sized(push, 11000)
+    }
+    fn sized(push: bool, length: usize) -> Self {
         let tmp = match std::env::var_os("RRSYNC_RESUME_TEST_FILESYSTEM") {
             Some(path) => tempfile::Builder::new()
                 .prefix("rrsync-v2-")
@@ -42,7 +45,7 @@ impl Fixture {
         for path in [&local, &remote, &sc, &cc] {
             fs::create_dir(path).unwrap();
         }
-        let bytes: Vec<u8> = (0..11000).map(|i| (i % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
         let (source, destination) = if push {
             (&local, &remote)
         } else {
@@ -330,6 +333,18 @@ fn peer_permission_change_and_lease_release_cache_lock() {
             [1; 16],
             [7; 16],
             Permission::Full,
+            Message::Hashes {
+                index: 0,
+                start: 0,
+                hashes: d.page(0).unwrap(),
+            },
+        )
+        .unwrap();
+    server
+        .handle(
+            [1; 16],
+            [7; 16],
+            Permission::Full,
             Message::ChunkBegin { index: 0, chunk: 0 },
         )
         .unwrap();
@@ -453,7 +468,7 @@ fn repeated_start_releases_pending_store_for_new_session() {
             Permission::Full,
             Message::Description {
                 index: 0,
-                description,
+                description: description.clone(),
             },
         )
         .unwrap();
@@ -479,7 +494,7 @@ async fn persisted_corruption_and_missing_close_require_revalidation_and_lease()
         .map(|entry| entry.unwrap().path())
         .find(|path| path.is_dir())
         .unwrap();
-    fs::write(transfer.join("00000000.chunk"), vec![0; 4096]).unwrap();
+    fs::write(transfer.join("00000000/00000000.chunk"), vec![0; 4096]).unwrap();
     let mut retry = f.link();
     f.run(&mut retry, true, false).await.unwrap();
     f.complete(true);
@@ -515,7 +530,19 @@ fn wrong_resource_receipt_and_changed_pull_source_abort_before_install() {
             Permission::Full,
             Message::Description {
                 index: 0,
-                description,
+                description: description.clone(),
+            },
+        )
+        .unwrap();
+    server
+        .handle(
+            [1; 16],
+            [7; 16],
+            Permission::Full,
+            Message::Hashes {
+                index: 0,
+                start: 0,
+                hashes: description.page(0).unwrap(),
             },
         )
         .unwrap();
@@ -585,6 +612,14 @@ fn wrong_resource_receipt_and_changed_pull_source_abort_before_install() {
                 index: 0,
                 chunk_size: 4096,
             },
+        )
+        .unwrap();
+    server
+        .handle(
+            [1; 16],
+            [7; 16],
+            Permission::Read,
+            Message::HashesGet { index: 0, start: 0 },
         )
         .unwrap();
     fs::write(f.remote.join("file"), b"source changed after snapshot").unwrap();
@@ -674,4 +709,190 @@ async fn automatic_reconnect_checks_fresh_permissions_before_using_cache() {
     assert!(result.is_err());
     assert_eq!(calls.get(), 2);
     f.intact(true);
+}
+
+#[tokio::test]
+#[ignore = "large filesystem integration: creates and fsyncs thousands of cached chunks"]
+async fn paged_resume_above_old_limit_transfers_only_missing_chunks() {
+    use rrsync::chunks::{Description, SHARD_CHUNKS, Store, scope};
+    // Seed disk cache directly to test thousands of chunks without thousands of fsyncs.
+    for push in [true, false] {
+        let f = Fixture::sized(push, 8193 * 4096 + 17);
+        let (source, cache, peer) = if push {
+            (&f.local, &f.server_cache, [7; 16])
+        } else {
+            (&f.remote, &f.client_cache, [8; 16])
+        };
+        let mut file = fs::File::open(source.join("file")).unwrap();
+        let d = Description::scan(&mut file, 4096).unwrap();
+        drop(
+            Store::open(
+                &cache.directory,
+                scope(peer, push, &cache.root_id, "file").unwrap(),
+                d.clone(),
+            )
+            .unwrap(),
+        );
+        let dir = fs::read_dir(&cache.directory)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.is_dir())
+            .unwrap();
+        for (i, bytes) in f.bytes.chunks(4096).enumerate() {
+            if [127, 128, 255, 256, 8192, 8193].contains(&i) {
+                continue;
+            }
+            let shard = dir.join(format!("{:08x}", i / SHARD_CHUNKS));
+            fs::create_dir_all(&shard).unwrap();
+            fs::write(shard.join(format!("{i:08x}.chunk")), bytes).unwrap();
+        }
+        let mut link = f.link();
+        f.run(&mut link, push, false).await.unwrap();
+        f.complete(push);
+        assert_eq!(link.stats.uploads + link.stats.downloads, 6);
+        assert_eq!(
+            link.stats.upload_bytes + link.stats.download_bytes,
+            5 * 4096 + 17
+        );
+        let page_tag = if push { 20 } else { 19 };
+        assert_eq!(
+            link.stats
+                .requests
+                .iter()
+                .filter(|&&tag| tag == page_tag)
+                .count(),
+            65
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn lost_or_duplicate_page_exchange_requires_fresh_session() {
+    for push in [true, false] {
+        for fault in [
+            Fault::DropResponse(if push { 20 } else { 19 }),
+            Fault::DuplicateRequest(if push { 20 } else { 19 }),
+        ] {
+            let f = Fixture::new(push);
+            let mut first = f.link();
+            first.fault = Some(fault);
+            assert!(f.run(&mut first, push, false).await.is_err());
+            f.intact(push);
+            let mut retry = f.link();
+            f.run(&mut retry, push, false).await.unwrap();
+            f.complete(push);
+        }
+    }
+}
+
+#[test]
+fn page_order_and_chunk_ranges_are_enforced_by_session() {
+    use rrsync::chunks::Description;
+    for case in 0..6 {
+        let push = case < 3;
+        let f = Fixture::sized(push, 257 * 4096);
+        let mut server = f.server.lock().unwrap();
+        let manifest = sync::scan(&Root::open(&f.local).unwrap(), true)
+            .unwrap()
+            .manifest;
+        server
+            .handle(
+                [1; 16],
+                [7; 16],
+                Permission::Full,
+                Message::Common(Common::Start {
+                    push,
+                    options: Options::default(),
+                    path: String::new(),
+                    manifest,
+                }),
+            )
+            .unwrap();
+        if push {
+            let mut file = fs::File::open(f.local.join("file")).unwrap();
+            let d = Description::scan(&mut file, 4096).unwrap();
+            server
+                .handle(
+                    [1; 16],
+                    [7; 16],
+                    Permission::Full,
+                    Message::Description {
+                        index: 0,
+                        description: d.clone(),
+                    },
+                )
+                .unwrap();
+            let bad = match case {
+                0 => Message::Hashes {
+                    index: 0,
+                    start: 128,
+                    hashes: d.page(128).unwrap(),
+                },
+                1 => Message::FileCommit(0),
+                _ => {
+                    server
+                        .handle(
+                            [1; 16],
+                            [7; 16],
+                            Permission::Full,
+                            Message::Hashes {
+                                index: 0,
+                                start: 0,
+                                hashes: d.page(0).unwrap(),
+                            },
+                        )
+                        .unwrap();
+                    Message::Hashes {
+                        index: 0,
+                        start: 128,
+                        hashes: d.page(128).unwrap(),
+                    }
+                }
+            };
+            assert!(
+                server
+                    .handle([1; 16], [7; 16], Permission::Full, bad)
+                    .is_err()
+            );
+        } else {
+            server
+                .handle(
+                    [1; 16],
+                    [7; 16],
+                    Permission::Full,
+                    Message::Describe {
+                        index: 0,
+                        chunk_size: 4096,
+                    },
+                )
+                .unwrap();
+            if case != 3 {
+                server
+                    .handle(
+                        [1; 16],
+                        [7; 16],
+                        Permission::Full,
+                        Message::HashesGet { index: 0, start: 0 },
+                    )
+                    .unwrap();
+            }
+            let bad = match case {
+                3 => Message::HashesGet {
+                    index: 0,
+                    start: 128,
+                },
+                4 => Message::FileVerified(0),
+                _ => Message::ChunkGet {
+                    index: 0,
+                    chunk: 128,
+                },
+            };
+            assert!(
+                server
+                    .handle([1; 16], [7; 16], Permission::Full, bad)
+                    .is_err()
+            );
+        }
+        f.intact(push);
+    }
 }

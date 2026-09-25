@@ -63,7 +63,7 @@ def partial_resource(process, size):
     return False
 
 def cached_large_chunk(directory):
-    for chunk in directory.glob('*/*.chunk'):
+    for chunk in directory.glob('*/*/*.chunk'):
         try:
             if chunk.stat().st_size == 2097152:
                 return True
@@ -129,7 +129,8 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
                     stale.mkdir(parents=True)
                     (stale/'lock').touch()
                     (stale/'activity').write_bytes(b'RRSYNC01' + (1).to_bytes(8, 'big'))
-                    (stale/'00000000.chunk').write_bytes(b'old cached bytes')
+                    (stale/'00000000').mkdir()
+                    (stale/'00000000'/'00000000.chunk').write_bytes(b'old cached bytes')
             cli('push','--checksum',source,remote)
             if args.protocol == 2:
                 assert not (server_config/'transfers'/('0'*64)).exists()

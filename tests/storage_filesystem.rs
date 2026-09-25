@@ -83,13 +83,13 @@ fn persistent_chunks_on_selected_filesystem() {
     reader.join().unwrap();
     ready.unwrap();
     let store = Store::open(&state, context(), description.clone()).unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     assert!(Store::open(&state, context(), description.clone()).is_err());
     // Cached data does not depend on exact timestamps, Unix modes or hard links.
     let root = Root::open(&directory(&state)).unwrap();
-    root.set_mtime("00000000.chunk", 1_700_000_001, 123_456_789)
+    root.set_mtime("00000000/00000000.chunk", 1_700_000_001, 123_456_789)
         .unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     for (index, part) in bytes.chunks(262_144).enumerate() {
         store.receive(index, &mut Cursor::new(part)).unwrap();
     }
@@ -98,9 +98,13 @@ fn persistent_chunks_on_selected_filesystem() {
             .receive(0, &mut Cursor::new(vec![0; 262_144]))
             .is_err()
     );
-    assert!(store.missing().unwrap().is_empty());
-    fs::write(directory(&state).join("00000001.chunk"), b"damaged").unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1]);
+    assert!(store.missing(0).unwrap().is_empty());
+    fs::write(
+        directory(&state).join("00000000/00000001.chunk"),
+        b"damaged",
+    )
+    .unwrap();
+    assert_eq!(store.missing(0).unwrap(), vec![1]);
     store
         .receive(1, &mut Cursor::new(&bytes[262_144..524_288]))
         .unwrap();
@@ -126,7 +130,7 @@ fn persistent_chunks_on_selected_filesystem() {
     assert_eq!(fs::read(fixture.path().join("installed")).unwrap(), bytes);
     drop(store);
     let store = Store::open(&state, context(), description).unwrap();
-    assert!(store.missing().unwrap().is_empty());
+    assert!(store.missing(0).unwrap().is_empty());
     store.clear().unwrap();
     assert_eq!(fs::read_dir(directory(&state)).unwrap().count(), 2);
 }
@@ -155,7 +159,7 @@ fn quota_and_cache_lock_on_selected_filesystem() {
     drop(store);
     assert!(Store::open_limited(fixture.path(), [1; 32], d.clone(), limits).is_err());
     let store = Store::open_limited(fixture.path(), context(), d, limits).unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     for (i, part) in bytes.chunks(262144).enumerate().skip(1) {
         store.receive(i, &mut Cursor::new(part)).unwrap();
     }

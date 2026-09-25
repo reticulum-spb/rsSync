@@ -1,4 +1,4 @@
-use rrsync::chunks::{Description, MAX_CHUNK_SIZE, MAX_CHUNKS, MIN_CHUNK_SIZE, Store, scope};
+use rrsync::chunks::{Description, MAX_CHUNK_SIZE, MIN_CHUNK_SIZE, Store, scope};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
@@ -43,26 +43,22 @@ fn geometry_and_hashes_are_bounded_and_deterministic() {
     }
     assert!(Description::count(u64::MAX, MIN_CHUNK_SIZE).is_err());
     assert_eq!(
-        Description::count(
-            MAX_CHUNKS as u64 * u64::from(MIN_CHUNK_SIZE),
-            MIN_CHUNK_SIZE
-        )
-        .unwrap(),
-        MAX_CHUNKS
+        Description::count(rrsync::sync::MAX_FILE, MIN_CHUNK_SIZE).unwrap(),
+        32768
     );
     let data = bytes();
     let d = description(&data, MIN_CHUNK_SIZE);
-    assert_eq!(d, description(&data, MIN_CHUNK_SIZE));
+    assert_eq!(d.hash(), description(&data, MIN_CHUNK_SIZE).hash());
     assert_eq!(d.size(), 9500);
     assert_eq!(d.chunk_size(), 4096);
     assert_eq!(d.length(2).unwrap(), 1308);
     assert!(d.length(3).is_err());
     assert_eq!(d.hash(), <[u8; 32]>::from(Sha256::digest(&data)));
-    for (part, hash) in data.chunks(4096).zip(d.hashes()) {
-        assert_eq!(*hash, <[u8; 32]>::from(Sha256::digest(part)));
+    for (part, hash) in data.chunks(4096).zip(d.page(0).unwrap()) {
+        assert_eq!(hash, <[u8; 32]>::from(Sha256::digest(part)));
     }
-    assert!(Description::new(9500, 4096, d.hash(), vec![]).is_err());
-    assert!(Description::new(0, 4096, [1; 32], vec![]).is_err());
+    assert!(d.set_page(0, &[]).is_err());
+    assert!(Description::header(0, 4096, [1; 32]).is_err());
 }
 
 #[test]
@@ -117,7 +113,7 @@ fn killed_writer_leaves_only_verified_chunks_available() {
     ready.unwrap();
     let data = bytes();
     let store = Store::open(tmp.path(), context(), description(&data, 4096)).unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     store
         .receive(1, &mut Cursor::new(&data[4096..8192]))
         .unwrap();
@@ -135,14 +131,14 @@ fn failed_or_duplicate_receive_preserves_verified_state() {
     store.receive(0, &mut Cursor::new(&data[..4096])).unwrap();
     for bad in [vec![0; 4096], vec![0; 4095], vec![0; 4097]] {
         assert!(store.receive(0, &mut Cursor::new(bad)).is_err());
-        assert_eq!(store.missing().unwrap(), vec![1, 2]);
+        assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     }
     assert!(store.receive(3, &mut Cursor::new([])).is_err());
     assert!(store.assemble().is_err());
     fill(&store, &data);
-    assert!(store.missing().unwrap().is_empty());
+    assert!(store.missing(0).unwrap().is_empty());
     assert_eq!(assembled(&store), data);
-    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 5);
+    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 3);
 }
 
 #[test]
@@ -152,17 +148,22 @@ fn corrupt_chunks_and_inconsistent_whole_hash_never_assemble() {
     let d = description(&data, 4096);
     let store = Store::open(tmp.path(), context(), d.clone()).unwrap();
     fill(&store, &data);
-    fs::write(chunk_dir(tmp.path()).join("00000001.chunk"), vec![0; 4096]).unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1]);
+    fs::write(
+        chunk_dir(tmp.path()).join("00000000/00000001.chunk"),
+        vec![0; 4096],
+    )
+    .unwrap();
+    assert_eq!(store.missing(0).unwrap(), vec![1]);
     assert!(store.assemble().is_err());
     store
         .receive(1, &mut Cursor::new(&data[4096..8192]))
         .unwrap();
     assert_eq!(assembled(&store), data);
-    let bad = Description::new(d.size(), d.chunk_size(), [1; 32], d.hashes().to_vec()).unwrap();
+    let bad = Description::header(d.size(), d.chunk_size(), [1; 32]).unwrap();
+    bad.set_page(0, &d.page(0).unwrap()).unwrap();
     let other = Store::open(tmp.path(), context(), bad).unwrap();
     fill(&other, &data);
-    assert!(other.missing().unwrap().is_empty());
+    assert!(other.missing(0).unwrap().is_empty());
     assert!(other.assemble().is_err());
 }
 
@@ -180,14 +181,14 @@ fn scope_and_description_changes_do_not_reuse_state() {
         scope([7; 16], true, "/export", "other"),
     ] {
         let other = Store::open(tmp.path(), changed.unwrap(), d.clone()).unwrap();
-        assert_eq!(other.missing().unwrap(), vec![0, 1, 2]);
+        assert_eq!(other.missing(0).unwrap(), vec![0, 1, 2]);
     }
     let other = Store::open(tmp.path(), context(), description(&data, 8192)).unwrap();
-    assert_eq!(other.missing().unwrap(), vec![0, 1]);
+    assert_eq!(other.missing(0).unwrap(), vec![0, 1]);
     let mut changed = data.clone();
     changed[0] ^= 1;
     let other = Store::open(tmp.path(), context(), description(&changed, 4096)).unwrap();
-    assert_eq!(other.missing().unwrap(), vec![0, 1, 2]);
+    assert_eq!(other.missing(0).unwrap(), vec![0, 1, 2]);
     assert!(scope([7; 16], true, "/export", "../file").is_err());
 }
 
@@ -213,9 +214,10 @@ fn state_paths_reject_symlinks_and_linked_locks() {
     let d = description(&bytes(), 4096);
     let store = Store::open(tmp.path(), context(), d.clone()).unwrap();
     let dir = chunk_dir(tmp.path());
-    symlink(&external, dir.join("00000000.chunk")).unwrap();
-    assert!(store.missing().is_err());
-    store.clear().unwrap();
+    fs::create_dir(dir.join("00000000")).unwrap();
+    symlink(&external, dir.join("00000000/00000000.chunk")).unwrap();
+    assert!(store.missing(0).is_err());
+    assert!(store.clear().is_err());
     assert_eq!(fs::read(&external).unwrap(), b"unchanged");
     drop(store);
     fs::remove_file(dir.join("lock")).unwrap();
@@ -231,12 +233,12 @@ fn state_paths_reject_symlinks_and_linked_locks() {
 fn empty_file_has_no_chunks_and_exact_boundary_has_no_tail() {
     let tmp = tempfile::tempdir().unwrap();
     let d = description(&[], 4096);
-    assert!(d.hashes().is_empty());
+    assert_eq!(d.chunks(), 0);
     let store = Store::open(tmp.path(), context(), d).unwrap();
-    assert!(store.missing().unwrap().is_empty());
+    assert!(store.missing(0).unwrap().is_empty());
     assert!(assembled(&store).is_empty());
     let d = description(&vec![42; 8192], 4096);
-    assert_eq!(d.hashes().len(), 2);
+    assert_eq!(d.chunks(), 2);
     assert_eq!(d.length(1).unwrap(), 4096);
 }
 
@@ -251,14 +253,14 @@ fn larger_chunks_stream_and_reject_reader_failure() {
     let tmp = tempfile::tempdir().unwrap();
     let data = vec![23; 1024 * 1024 + 1];
     let d = description(&data, 256 * 1024);
-    assert_eq!(d.hashes().len(), 5);
+    assert_eq!(d.chunks(), 5);
     assert_eq!(d.length(4).unwrap(), 1);
     let store = Store::open(tmp.path(), context(), d).unwrap();
     for (index, chunk) in data.chunks(256 * 1024).enumerate() {
         store.receive(index, &mut Cursor::new(chunk)).unwrap();
     }
     assert!(store.receive(0, &mut Interrupted).is_err());
-    assert!(store.missing().unwrap().is_empty());
+    assert!(store.missing(0).unwrap().is_empty());
     assert_eq!(assembled(&store), data);
 }
 
@@ -278,7 +280,7 @@ fn cache_quota_reserves_missing_bytes_and_excludes_concurrent_owners() {
     store.receive(0, &mut Cursor::new(&data[..4096])).unwrap();
     drop(store);
     let store = Store::open_limited(tmp.path(), context(), d.clone(), limits).unwrap();
-    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    assert_eq!(store.missing(0).unwrap(), vec![1, 2]);
     drop(store);
     assert!(Store::open_limited(tmp.path(), [9; 32], d.clone(), limits).is_err());
     assert!(
@@ -316,7 +318,7 @@ fn expiry_rejects_symlinks_without_deleting_cached_or_external_data() {
     let mut activity = b"RRSYNC01".to_vec();
     activity.extend(1u64.to_be_bytes());
     fs::write(dir.join("activity"), activity).unwrap();
-    symlink(&external, dir.join("00000003.chunk")).unwrap();
+    symlink(&external, dir.join("00000000/00000003.chunk")).unwrap();
     let limits = Limits {
         max_bytes: 100000,
         max_transfers: 4,
@@ -324,5 +326,8 @@ fn expiry_rejects_symlinks_without_deleting_cached_or_external_data() {
     };
     assert!(Store::open_limited(tmp.path(), [9; 32], d, limits).is_err());
     assert_eq!(fs::read(&external).unwrap(), b"outside");
-    assert_eq!(fs::read(dir.join("00000000.chunk")).unwrap(), &data[..4096]);
+    assert_eq!(
+        fs::read(dir.join("00000000/00000000.chunk")).unwrap(),
+        &data[..4096]
+    );
 }

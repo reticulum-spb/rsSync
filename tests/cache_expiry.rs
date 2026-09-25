@@ -62,7 +62,7 @@ fn expiry_reclaims_bytes_staging_and_directory_quota_without_using_mtime() {
         .unwrap();
     let store = Store::open_limited(tmp.path(), [2; 32], description(), limits(3600)).unwrap();
     assert!(!old.exists());
-    assert_eq!(store.missing().unwrap(), vec![0]);
+    assert_eq!(store.missing(0).unwrap(), vec![0]);
     store.receive(0, &mut Cursor::new([42; 4096])).unwrap();
     store.clear().unwrap();
     drop(store);
@@ -78,9 +78,9 @@ fn disabled_expiry_and_current_transfer_keep_verified_chunks() {
     let old = seed(tmp.path());
     timestamp(&old, 1);
     assert!(Store::open_limited(tmp.path(), [2; 32], description(), limits(0)).is_err());
-    assert!(old.join("00000000.chunk").exists());
+    assert!(old.join("00000000/00000000.chunk").exists());
     let current = Store::open_limited(tmp.path(), [1; 32], description(), limits(1)).unwrap();
-    assert!(current.missing().unwrap().is_empty());
+    assert!(current.missing(0).unwrap().is_empty());
     assert!(Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).is_err());
     drop(current);
     // Closing refreshed activity; an immediate competing transfer cannot evict it.
@@ -99,10 +99,13 @@ fn missing_corrupt_and_future_activity_get_conservative_retention() {
         }
         Root::open(&old)
             .unwrap()
-            .set_mtime("00000000.chunk", 1_000_000_001, 0)
+            .set_mtime("00000000/00000000.chunk", 1_000_000_001, 0)
             .unwrap();
         assert!(Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).is_err());
-        assert_eq!(fs::read(old.join("00000000.chunk")).unwrap(), [42; 4096]);
+        assert_eq!(
+            fs::read(old.join("00000000/00000000.chunk")).unwrap(),
+            [42; 4096]
+        );
         let record = fs::read(old.join("activity")).unwrap();
         assert_eq!(record.len(), 16);
         let time = u64::from_be_bytes(record[8..].try_into().unwrap());
@@ -126,7 +129,7 @@ fn shared_library_owners_prevent_cleanup_and_exclusive_owners_prevent_open() {
     let library = Store::open(tmp.path(), [1; 32], description()).unwrap();
     timestamp(&old, 1);
     assert!(Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).is_err());
-    assert!(library.missing().unwrap().is_empty());
+    assert!(library.missing(0).unwrap().is_empty());
     drop(library);
     timestamp(&old, 1);
     let exclusive = Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).unwrap();
@@ -143,7 +146,7 @@ fn unexpected_objects_stop_cleanup_before_deleting_transfer_contents() {
     timestamp(&old, 1);
     fs::write(old.join("unrecognized"), b"keep").unwrap();
     assert!(Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).is_err());
-    assert!(old.join("00000000.chunk").exists());
+    assert!(old.join("00000000/00000000.chunk").exists());
     assert_eq!(fs::read(old.join("unrecognized")).unwrap(), b"keep");
 }
 
@@ -152,7 +155,32 @@ fn interrupted_eviction_is_recoverable() {
     let tmp = fixture();
     let old = seed(tmp.path());
     timestamp(&old, 1);
-    fs::remove_file(old.join("00000000.chunk")).unwrap();
+    fs::remove_file(old.join("00000000/00000000.chunk")).unwrap();
     drop(Store::open_limited(tmp.path(), [2; 32], description(), limits(1)).unwrap());
+    assert!(!old.exists());
+}
+
+#[test]
+fn shards_cross_boundaries_and_expire_together() {
+    let tmp = fixture();
+    let mut file = tempfile::tempfile().unwrap();
+    file.write_all(&vec![42; 257 * 4096]).unwrap();
+    let d = Description::scan(&mut file, 4096).unwrap();
+    let policy = Limits {
+        max_bytes: 257 * 4096,
+        max_transfers: 1,
+        retention_seconds: 1,
+    };
+    let store = Store::open_limited(tmp.path(), [1; 32], d.clone(), policy).unwrap();
+    for i in [255, 256] {
+        store.receive(i, &mut Cursor::new([42; 4096])).unwrap();
+    }
+    let old = directory(tmp.path());
+    assert!(old.join("00000000/000000ff.chunk").is_file());
+    assert!(old.join("00000001/00000100.chunk").is_file());
+    assert!(store.missing(256).unwrap().is_empty());
+    drop(store);
+    timestamp(&old, 1);
+    drop(Store::open_limited(tmp.path(), [2; 32], d, policy).unwrap());
     assert!(!old.exists());
 }

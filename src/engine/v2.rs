@@ -2,7 +2,7 @@
 use super::{ConnectionId, ReceivedFile, SyncRequest, SyncTransport, check_source, require_file};
 use crate::{
     Error, Result,
-    chunks::{self, Description, Store},
+    chunks::{self, Description, PAGE_CHUNKS, Store},
     config::Permission,
     fs::{Root, snapshot},
     protocol::{
@@ -75,6 +75,8 @@ struct Transfer {
     payload: Payload,
     pending: Option<usize>,
     received: Option<ReceivedFile>,
+    next_page: usize,
+    page_start: usize,
 }
 pub struct Server {
     base: super::Server,
@@ -225,20 +227,20 @@ impl Server {
                     &s.source.entries[i],
                     description.clone(),
                 )?;
-                let missing: BTreeSet<_> = store.missing()?.into_iter().collect();
-                let reply = Message::Missing {
-                    index,
-                    chunks: missing.iter().map(|&i| i as u32).collect(),
-                };
                 self.transfer = Some(Transfer {
                     index: i,
                     description,
-                    payload: Payload::Upload { store, missing },
+                    payload: Payload::Upload {
+                        store,
+                        missing: BTreeSet::new(),
+                    },
                     pending: None,
                     received: None,
+                    next_page: 0,
+                    page_start: 0,
                 });
                 s.pending = Some(i);
-                return Ok(ServerReply::Message(reply));
+                return Ok(ServerReply::Message(Message::Common(Common::Ok)));
             }
             Message::Describe { index, chunk_size } => {
                 let i = index as usize;
@@ -260,11 +262,54 @@ impl Server {
                     },
                     pending: None,
                     received: None,
+                    next_page: 0,
+                    page_start: 0,
                 });
                 s.pending = Some(i);
                 return Ok(ServerReply::Message(Message::Description {
                     index,
                     description,
+                }));
+            }
+            Message::Hashes {
+                index,
+                start,
+                hashes,
+            } => {
+                let t = transfer(&mut self.transfer, index)?;
+                let Payload::Upload { store, missing } = &mut t.payload else {
+                    return Err(invalid("not an upload"));
+                };
+                if t.pending.is_some() || !missing.is_empty() || start as usize != t.next_page {
+                    return Err(invalid("unexpected hash page"));
+                }
+                t.description.set_page(start as usize, &hashes)?;
+                *missing = store.missing(start as usize)?.into_iter().collect();
+                t.page_start = start as usize;
+                t.next_page += hashes.len();
+                return Ok(ServerReply::Message(Message::Missing {
+                    index,
+                    start,
+                    count: hashes.len() as u32,
+                    chunks: missing.iter().map(|&i| i as u32).collect(),
+                }));
+            }
+            Message::HashesGet { index, start } => {
+                let t = transfer(&mut self.transfer, index)?;
+                let Payload::Download { served, .. } = &mut t.payload else {
+                    return Err(invalid("not a download"));
+                };
+                if t.pending.is_some() || start as usize != t.next_page {
+                    return Err(invalid("unexpected hash page request"));
+                }
+                let hashes = t.description.page(start as usize)?;
+                served.clear();
+                t.page_start = start as usize;
+                t.next_page += hashes.len();
+                return Ok(ServerReply::Message(Message::Hashes {
+                    index,
+                    start,
+                    hashes,
                 }));
             }
             Message::ChunkBegin { index, chunk } => {
@@ -308,7 +353,11 @@ impl Server {
                 let Payload::Download { file, served } = &mut t.payload else {
                     return Err(invalid("not a download"));
                 };
-                if t.pending.is_some() || served.contains(&(chunk as usize)) {
+                if t.pending.is_some()
+                    || served.contains(&(chunk as usize))
+                    || (chunk as usize) < t.page_start
+                    || (chunk as usize) >= t.next_page
+                {
                     return Err(invalid("chunk already requested"));
                 }
                 let file = chunk_file(file, &t.description, chunk as usize)?;
@@ -334,7 +383,10 @@ impl Server {
                 let Payload::Upload { store, missing } = &t.payload else {
                     return Err(invalid("not an upload"));
                 };
-                if t.pending.is_some() || !missing.is_empty() {
+                if t.pending.is_some()
+                    || !missing.is_empty()
+                    || t.next_page != t.description.chunks()
+                {
                     return Err(invalid("unfinished chunks"));
                 }
                 let mut file = store.assemble()?;
@@ -352,7 +404,10 @@ impl Server {
             }
             Message::FileVerified(index) => {
                 let t = transfer(&mut self.transfer, index)?;
-                if !matches!(t.payload, Payload::Download { .. }) || t.pending.is_some() {
+                if !matches!(t.payload, Payload::Download { .. })
+                    || t.pending.is_some()
+                    || t.next_page != t.description.chunks()
+                {
                     return Err(invalid("unexpected file verification"));
                 }
                 let e = &s.source.entries[t.index];
@@ -475,10 +530,7 @@ async fn synchronize_inner(
             let mut file = snapshot(root, &e.path, &scan.stamps[&e.path])?;
             let description = Description::scan(&mut file, resume.chunk_size)?;
             validate_description(e, &description)?;
-            let Message::Missing {
-                index: actual,
-                chunks,
-            } = request(
+            ok(
                 link,
                 Message::Description {
                     index,
@@ -486,31 +538,51 @@ async fn synchronize_inner(
                 },
                 deadline,
             )
-            .await?
-            else {
-                return Err(invalid("expected missing chunks"));
-            };
-            if actual != index {
-                return Err(invalid("unexpected file index"));
-            }
-            validate_missing(&chunks, description.hashes().len())?;
-            tracing::info!(path=%e.path, cached_chunks=description.hashes().len()-chunks.len(), missing_chunks=chunks.len(), "resume plan");
-            for chunk in chunks {
-                let part = chunk_file(&mut file, &description, chunk as usize)?;
-                ok(link, Message::ChunkBegin { index, chunk }, deadline).await?;
-                let resource = link
-                    .send_file(part, description.length(chunk as usize)?, deadline)
-                    .await?;
-                ok(
+            .await?;
+            for start in (0..description.chunks()).step_by(PAGE_CHUNKS) {
+                let hashes = description.page(start)?;
+                let count = hashes.len();
+                let Message::Missing {
+                    index: actual,
+                    start: actual_start,
+                    count: actual_count,
+                    chunks,
+                } = request(
                     link,
-                    Message::ChunkCommit {
+                    Message::Hashes {
                         index,
-                        chunk,
-                        resource,
+                        start: start as u32,
+                        hashes,
                     },
                     deadline,
                 )
-                .await?;
+                .await?
+                else {
+                    return Err(invalid("expected missing page"));
+                };
+                if actual != index || actual_start != start as u32 || actual_count as usize != count
+                {
+                    return Err(invalid("unexpected missing page"));
+                }
+                validate_missing(&chunks, actual_start, count)?;
+                tracing::info!(path=%e.path, page_start=start, cached_chunks=count-chunks.len(), missing_chunks=chunks.len(), "resume plan");
+                for chunk in chunks {
+                    let part = chunk_file(&mut file, &description, chunk as usize)?;
+                    ok(link, Message::ChunkBegin { index, chunk }, deadline).await?;
+                    let resource = link
+                        .send_file(part, description.length(chunk as usize)?, deadline)
+                        .await?;
+                    ok(
+                        link,
+                        Message::ChunkCommit {
+                            index,
+                            chunk,
+                            resource,
+                        },
+                        deadline,
+                    )
+                    .await?;
+                }
             }
             sync::ensure_unchanged(root, &e.path, &scan.stamps[&e.path])?;
             ok(link, Message::FileCommit(index), deadline).await?;
@@ -537,33 +609,55 @@ async fn synchronize_inner(
             let store = resume
                 .cache
                 .open(resume.peer, false, &path, e, description.clone())?;
-            let missing = store.missing()?;
-            tracing::info!(path=%e.path, cached_chunks=description.hashes().len()-missing.len(), missing_chunks=missing.len(), "resume plan");
-            for chunk in missing {
-                ok(
+            for start in (0..description.chunks()).step_by(PAGE_CHUNKS) {
+                let Message::Hashes {
+                    index: actual,
+                    start: actual_start,
+                    hashes,
+                } = request(
                     link,
-                    Message::ChunkGet {
+                    Message::HashesGet {
                         index,
-                        chunk: chunk as u32,
+                        start: start as u32,
                     },
                     deadline,
                 )
-                .await?;
-                let size = description.length(chunk)?;
-                let mut received = link.receive_file(size, deadline).await?;
-                if received.has_metadata || received.size != size {
-                    return Err(invalid("unexpected chunk Resource"));
+                .await?
+                else {
+                    return Err(invalid("expected hash page"));
+                };
+                if actual != index || actual_start as usize != start {
+                    return Err(invalid("unexpected hash page"));
                 }
-                store.receive(chunk, &mut received.file)?;
-                ok(
-                    link,
-                    Message::ChunkVerified {
-                        index,
-                        chunk: chunk as u32,
-                    },
-                    deadline,
-                )
-                .await?;
+                description.set_page(start, &hashes)?;
+                let missing = store.missing(start)?;
+                tracing::info!(path=%e.path, page_start=start, cached_chunks=hashes.len()-missing.len(), missing_chunks=missing.len(), "resume plan");
+                for chunk in missing {
+                    ok(
+                        link,
+                        Message::ChunkGet {
+                            index,
+                            chunk: chunk as u32,
+                        },
+                        deadline,
+                    )
+                    .await?;
+                    let size = description.length(chunk)?;
+                    let mut received = link.receive_file(size, deadline).await?;
+                    if received.has_metadata || received.size != size {
+                        return Err(invalid("unexpected chunk Resource"));
+                    }
+                    store.receive(chunk, &mut received.file)?;
+                    ok(
+                        link,
+                        Message::ChunkVerified {
+                            index,
+                            chunk: chunk as u32,
+                        },
+                        deadline,
+                    )
+                    .await?;
+                }
             }
             let mut file = store.assemble()?;
             ok(link, Message::FileVerified(index), deadline).await?;
