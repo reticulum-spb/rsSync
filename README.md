@@ -150,6 +150,10 @@ replayed after an uncertain result. Source changes detected during a run
 cause failure. Chunk resume, delta transfer and automatic session reconnection are
 not implemented.
 
+After a server process exits, restart `serve` with the same configuration directory
+and export directory, then rerun the client command. The saved identity preserves
+the server destination; completed files remain available for the new comparison.
+
 With `--delete`, replacing a directory by a file first receives and verifies the
 file, then removes the conflicting directory contents. This type change is not an
 atomic directory transaction. Replacing a file by a directory also requires removal

@@ -210,6 +210,12 @@ installed; a lost FINISH response during push may mean deletion has completed.
 During pull, the client must retain extras until it receives FINISH/OK. A new
 session compares current manifests and skips files already installed.
 
+After a server process restart, load the same persistent identity and register the
+same `rrsync.sync` destination again. Previous Links and in-memory session state
+are not restored. The client must establish a fresh authenticated Link and start
+with START; unfinished files are transferred in full. Keep the same export root
+to let the new manifest reflect previously committed files.
+
 Protocol errors abort only the offending connection's session. Out-of-order or
 repeated mutation commands are rejected; a busy request from a different Link
 must not release the active export session. Discard file completions from another
