@@ -24,6 +24,8 @@ the sample, include shared-instance framing and possibly unrelated incoming
 announces, and exclude traffic after sampling. They are neither per-Link payload
 counts nor radio airtime measurements. This diagnostic is not a wire message and
 does not require a corresponding Python protocol feature.
+The same diagnostic mode reports the client's Linux `VmHWM` before shutdown;
+this is process resident memory, excluding the shared daemon and kernel page cache.
 
 The application configuration directory is selected with `--config DIRECTORY`,
 defaulting to `~/.rsSync`. It contains `config.yaml` and the fixed private-key file
@@ -155,6 +157,9 @@ in pull this is the destination. The server scans the requested export subtree,
 builds/validates a plan, and returns its own manifest in MANIFEST. Both peers derive
 the same plan; no separate plan is transmitted. Finish plan construction before
 any data transfer. Only one active session is admitted per exported server root.
+Even an unchanged tree exchanges complete manifests in both directions. Directory
+entries count toward the 16,384-entry bound. Version 2 hash pagination applies to
+chunks within a file; it does not paginate or suppress this manifest exchange.
 
 A regular file is skipped if path, type, size, seconds and nanoseconds match, and
 in checksum mode both SHA-256 hashes also match. Other regular files are transferred.

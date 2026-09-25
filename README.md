@@ -227,7 +227,8 @@ Both push and pull print the plan before transferring data, using `Skip`, `Mkdir
   conflicts between files and directories are errors.
 - `--checksum` checks SHA-256 content hashes in addition to path, size and mtime.
 - `-v` / `--verbose` enables diagnostic logging, including available client-local
-  interface RX/TX byte counters before runtime shutdown. These include local
+  interface RX/TX byte counters and the client's peak resident memory from Linux
+  `/proc/self/status` before runtime shutdown. Byte counters include local
   shared-instance framing and may include incoming announces unrelated to the
   sync; they do not measure radio airtime or daemon-wide traffic.
 
@@ -270,7 +271,8 @@ atomic directory transaction. Replacing a file by a directory also requires remo
 of the conflicting file. Protected objects prevent destructive type replacement.
 
 Individual files are limited to 134,217,727 bytes by the current Reticulum library.
-Each scanned directory tree is limited to 16,384 entries and its
+Each scanned directory tree is limited to 16,384 entries, counting both files and
+subdirectories, and its
 encoded control message to 8 MiB. Relative paths must be UTF-8, at most 4,096 bytes,
 with at most 128 components, each no longer than 255 bytes. Linux 5.6 or newer
 and a mounted `/proc` are required. Failed runs

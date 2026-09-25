@@ -515,6 +515,17 @@ pub async fn client(
                 );
             }
         }
+        if let Ok(status) = std::fs::read_to_string("/proc/self/status")
+            && let Some(peak_rss_kib) = status.lines().find_map(|line| {
+                line.strip_prefix("VmHWM:")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u64>()
+                    .ok()
+            })
+        {
+            tracing::debug!(peak_rss_kib, "client peak resident memory before shutdown");
+        }
     }
     shutdown.trigger();
     result

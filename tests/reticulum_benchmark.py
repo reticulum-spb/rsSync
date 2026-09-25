@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -21,8 +22,13 @@ def digest(path):
 
 
 def snapshot(directory):
-    return {str(p.relative_to(directory)): (p.stat().st_size, p.stat().st_mtime_ns, digest(p))
-            for p in directory.rglob('*') if p.is_file()}
+    result = {}
+    for path in directory.rglob('*'):
+        info = path.stat()
+        result[str(path.relative_to(directory))] = (
+            ('file', info.st_size, info.st_mtime_ns, digest(path)) if path.is_file()
+            else ('directory', info.st_mtime_ns))
+    return result
 
 
 def stop(process):
@@ -35,10 +41,10 @@ def stop(process):
             process.wait()
 
 
-def rss(pid):
+def rss(pid, field="VmRSS"):
     try:
         for line in Path(f'/proc/{pid}/status').read_text().splitlines():
-            if line.startswith('VmRSS:'):
+            if line.startswith(field + ':'):
                 return int(line.split()[1])
     except FileNotFoundError:
         pass
@@ -90,7 +96,9 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
             directory.mkdir()
         # Deterministic, bounded generation; no highly compressible repeating block.
         for index in range(a.files):
-            with (source / f'{index:06}.bin').open('wb') as stream:
+            parent = source if not a.files_per_directory else source / f'd{index // a.files_per_directory:06}'
+            parent.mkdir(exist_ok=True)
+            with (parent / f'{index:06}.bin').open('wb') as stream:
                 remaining = a.size
                 counter = 0
                 while remaining:
@@ -99,7 +107,11 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
                     remaining -= len(block)
                     counter += 1
                 stream.flush()
-                os.fsync(stream.fileno())
+                if a.scenario == 'full':
+                    os.fsync(stream.fileno())
+        if a.scenario == 'unchanged':
+            shutil.copytree(source, export / 'backup')
+            shutil.copytree(source, download, dirs_exist_ok=True)
         expected = snapshot(source)
         client_config, server_config = root / 'client', root / 'server'
         client_config.mkdir(); server_config.mkdir()
@@ -126,7 +138,9 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
                     if server.poll() is not None or time.monotonic() > deadline:
                         raise RuntimeError('server not ready: ' + log[-4000:])
                     time.sleep(.05)
-                for direction, warm in [('push', False), ('push', True), ('pull', False), ('pull', True)]:
+                phases = ([('push', True), ('pull', True)] if a.scenario == 'unchanged' else
+                          [('push', False), ('push', True), ('pull', False), ('pull', True)])
+                for direction, warm in phases:
                     phase = direction + ('_unchanged' if warm else '_cold')
                     arguments = [str(source), remote] if direction == 'push' else [remote, str(download)]
                     log_path = root / (phase + '.log')
@@ -134,6 +148,7 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
                     baseline = allocated(root, [server], misses)
                     peaks = dict(client_rss_kib=0, server_rss_kib=0, allocated_bytes=baseline)
                     samples = 0
+                    sampling_seconds = 0.0
                     started = time.monotonic()
                     with log_path.open('w') as log_file:
                         client = subprocess.Popen([str(binary), '--config', str(client_config), direction,
@@ -144,14 +159,20 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
                                     raise RuntimeError('server exited during benchmark')
                                 if time.monotonic() - started > a.timeout:
                                     raise RuntimeError('client timed out')
+                                sample_started = time.monotonic()
                                 peaks['client_rss_kib'] = max(peaks['client_rss_kib'], rss(client.pid))
                                 peaks['server_rss_kib'] = max(peaks['server_rss_kib'], rss(server.pid))
-                                peaks['allocated_bytes'] = max(peaks['allocated_bytes'], allocated(root, [client, server], misses))
+                                if a.disk_sampling == 'periodic':
+                                    peaks['allocated_bytes'] = max(peaks['allocated_bytes'], allocated(root, [client, server], misses))
+                                sampling_seconds += time.monotonic() - sample_started
                                 samples += 1
                                 time.sleep(a.sample_interval)
                             elapsed = time.monotonic() - started
                         finally:
                             stop(client)
+                    server_peak = rss(server.pid, 'VmHWM')
+                    if a.disk_sampling == 'endpoints':
+                        peaks['allocated_bytes'] = max(peaks['allocated_bytes'], allocated(root, [server], misses))
                     log = re.sub(r'\x1b\[[0-9;]*m', '', log_path.read_text())
                     if client.returncode != 0:
                         raise RuntimeError(f'{phase} failed: {log[-4000:]}')
@@ -164,9 +185,14 @@ def run_case(a, binary, rns, chunk, repeat, output, metadata):
                     if len(counters) != 1:
                         raise RuntimeError(f'expected exactly one local interface counter record: {log[-4000:]}')
                     rx, tx = map(int, counters[0])
+                    memory = re.findall(r'client peak resident memory.*?peak_rss_kib=(\d+)', log)
+                    if len(memory) != 1:
+                        raise RuntimeError('expected one client kernel RSS peak diagnostic')
+                    process_peak = dict(client=int(memory[0]), server=server_peak)
                     record = dict(metadata, repeat=repeat, chunk_size=chunk, phase=phase,
                                   elapsed_seconds=elapsed, samples=samples, sampled_peak=peaks,
-                                  sampling_misses=misses,
+                                  sampling_misses=misses, sampling_seconds=sampling_seconds,
+                                  process_peak_rss_kib=process_peak,
                                   allocated_baseline_bytes=baseline, client_local_rx_bytes=rx,
                                   client_local_tx_bytes=tx, planned_files=planned)
                     output.write(json.dumps(record) + '\n'); output.flush()
@@ -182,16 +208,24 @@ def main():
     p.add_argument('--directory', type=Path, default=Path('/tmp'))
     p.add_argument('--size', type=int, default=1048576, help='bytes per source file')
     p.add_argument('--files', type=int, default=1)
+    p.add_argument('--files-per-directory', type=int, default=0, help='0 for a flat tree; otherwise group files in subdirectories')
+    p.add_argument('--scenario', choices=['full', 'unchanged'], default='full',
+                   help='full transfer/recheck, or compare preseeded identical trees')
     p.add_argument('--chunks', type=int, nargs='+', default=[4096, 65536, 1048576])
     p.add_argument('--repeats', type=int, default=3)
     p.add_argument('--sample-interval', type=float, default=.05)
+    p.add_argument('--disk-sampling', choices=['periodic', 'endpoints'], default='periodic',
+                   help='endpoints avoids repeated tree walks but misses transient disk use')
     p.add_argument('--timeout', type=float, default=300)
     p.add_argument('--output', type=Path, required=True)
     a = p.parse_args()
-    if not (0 <= a.size <= 134217727 and 1 <= a.files <= 16383 and a.repeats > 0 and
+    if not (0 <= a.size <= 134217727 and 1 <= a.files <= 16383 and a.repeats > 0 and a.files_per_directory >= 0 and
             .01 <= a.sample_interval <= 10 and 0 < a.timeout <= 86400 and
             all(4096 <= c <= 16777216 for c in a.chunks)):
         p.error('invalid size, files, repeats, chunk size, sampling interval or timeout')
+    directories = (a.files + a.files_per_directory - 1) // a.files_per_directory if a.files_per_directory else 0
+    if a.files + directories > 16384:
+        p.error('files plus subdirectories exceed the 16384-entry manifest limit')
     binary = a.binary.resolve(strict=True)
     rns = a.reticulum_config.expanduser().resolve(strict=True)
     a.directory = a.directory.resolve(strict=True)
@@ -199,7 +233,9 @@ def main():
                     size=a.size, files=a.files, directory=str(a.directory),
                     filesystem=subprocess.check_output(['findmnt', '-T', str(a.directory), '-n', '-o', 'FSTYPE'], text=True).strip(),
                     tmpdir=os.environ.get('TMPDIR', '/tmp'), sample_interval=a.sample_interval,
-                    protocol=2, checksum=True)
+                    protocol=2, checksum=True, scenario=a.scenario,
+                    files_per_directory=a.files_per_directory, manifest_entries=a.files + directories,
+                    disk_sampling=a.disk_sampling)
     with a.output.open('x') as output:
         for repeat in range(a.repeats):
             for chunk in a.chunks:
