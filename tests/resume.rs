@@ -595,3 +595,84 @@ fn wrong_resource_receipt_and_changed_pull_source_abort_before_install() {
     ));
     f.intact(false);
 }
+
+#[tokio::test(start_paused = true)]
+async fn automatic_reconnect_rescans_and_reuses_chunks_after_uncertain_results() {
+    use rrsync::reconnect::{Policy, run};
+    for (push, fault) in [
+        (true, Fault::InterruptUpload(2)),
+        (false, Fault::InterruptDownload(2)),
+        (true, Fault::DropResponse(14)),
+        (false, Fault::DropResponse(16)),
+        (true, Fault::DropResponse(17)),
+        (false, Fault::DropResponse(18)),
+        (true, Fault::DropResponse(7)),
+        (false, Fault::DropResponse(7)),
+    ] {
+        let f = Fixture::new(push);
+        let stats = Mutex::new(Vec::new());
+        let policy = Policy {
+            attempts: 2,
+            delay_seconds: 1,
+            max_delay_seconds: 2,
+            max_elapsed_seconds: 60,
+        };
+        run(&policy, |n| {
+            let f = &f;
+            let stats = &stats;
+            async move {
+                let mut link = f.link();
+                link.connection = [n as u8 + 1; 16];
+                if n == 0 {
+                    link.fault = Some(fault);
+                }
+                let result = f.run(&mut link, push, false).await;
+                stats
+                    .lock()
+                    .unwrap()
+                    .push(link.stats.upload_bytes + link.stats.download_bytes);
+                result
+            }
+        })
+        .await
+        .unwrap();
+        f.complete(push);
+        let stats = stats.into_inner().unwrap();
+        assert_eq!(stats.len(), 2);
+        let remaining = match fault {
+            Fault::DropResponse(17 | 18 | 7) => 0,
+            _ => 6904,
+        };
+        assert_eq!(stats[1], remaining, "{push} {fault:?}");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn automatic_reconnect_checks_fresh_permissions_before_using_cache() {
+    let f = Fixture::new(true);
+    let calls = std::cell::Cell::new(0);
+    let policy = rrsync::reconnect::Policy {
+        attempts: 3,
+        delay_seconds: 1,
+        max_delay_seconds: 2,
+        max_elapsed_seconds: 60,
+    };
+    let result = rrsync::reconnect::run(&policy, |n| {
+        calls.set(calls.get() + 1);
+        let f = &f;
+        async move {
+            let mut link = f.link();
+            link.connection = [n as u8 + 1; 16];
+            if n == 0 {
+                link.fault = Some(Fault::InterruptUpload(2));
+            } else {
+                link.permission = Permission::Read;
+            }
+            f.run(&mut link, true, false).await
+        }
+    })
+    .await;
+    assert!(result.is_err());
+    assert_eq!(calls.get(), 2);
+    f.intact(true);
+}

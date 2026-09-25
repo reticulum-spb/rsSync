@@ -19,8 +19,13 @@ parser.add_argument('reticulum_config', nargs='?', default='~/.rsReticulum')
 parser.add_argument('--lifecycle-only', action='store_true',
                     help='run only interrupted pull and server restart scenarios')
 parser.add_argument('--protocol', type=int, choices=[1, 2], default=1)
+parser.add_argument('--reconnect', action='store_true', help='keep clients alive across server restarts (requires v2)')
 args = parser.parse_args()
+if args.reconnect and args.protocol != 2:
+    parser.error('--reconnect requires --protocol 2')
 resume_yaml = ('protocol: 2\nresume:\n  chunk_size: 2097152\n' if args.protocol == 2 else '')
+if args.reconnect:
+    resume_yaml += 'reconnect: {attempts: 3, delay_seconds: 2, max_delay_seconds: 5, max_elapsed_seconds: 120}\n'
 binary = str(pathlib.Path(args.binary).resolve())
 reticulum_config = str(pathlib.Path(args.reticulum_config).expanduser().resolve())
 
@@ -216,7 +221,19 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
                 time.sleep(10)
             else:
                 server.kill(); server.wait(timeout=5)
-                # The survivor must report failure on its own, within its deadline.
+                assert (receiver_tree/'b-large').read_bytes() == b'old file must survive'
+                assert (receiver_tree/'extra').exists()
+                if args.reconnect:
+                    server, restarted_dest = start_server()
+                    assert restarted_dest == dest
+                    assert transfer.wait(timeout=150) == 0, 'automatic reconnect failed'
+                    log.flush(); log.seek(0); recovered = log.read()
+                    assert 'reconnecting with a fresh synchronization session' in recovered, recovered
+                    assert re.search(r'cached_chunks=[1-9]', recovered), recovered
+                    assert contents(sender_tree) == contents(receiver_tree), scenario+' automatic recovery mismatch'
+                    print('PASS: '+scenario+' recovered automatically in the original client process', flush=True)
+                    continue
+                # Without reconnect, the survivor reports failure within its deadline.
                 assert transfer.wait(timeout=40) != 0, 'client reported success after server death'
                 server, restarted_dest = start_server()
                 assert restarted_dest == dest, 'server identity changed after restart'

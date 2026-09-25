@@ -39,8 +39,10 @@ impl Message {
             Error::HashMismatch(_) => 4,
             Error::Protocol(_) => 5,
             Error::Io(_) => 6,
-            Error::Transport(_) => 7,
+            Error::Transport(_) | Error::Connection(_) => 7,
             Error::Config(_) => 8,
+            Error::Busy => 9,
+            Error::Remote { code, .. } => *code,
         };
         let text = e.to_string().chars().take(240).collect();
         Self::Error { code, text }

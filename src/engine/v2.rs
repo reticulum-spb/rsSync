@@ -394,7 +394,7 @@ async fn request(
     let response = link.request(message.encode()?, deadline).await?;
     let message = Message::decode(&response)?;
     if let Message::Common(Common::Error { code, text }) = message {
-        return Err(invalid(&format!("remote error {code}: {text}")));
+        return Err(Error::Remote { code, text });
     }
     Ok(message)
 }

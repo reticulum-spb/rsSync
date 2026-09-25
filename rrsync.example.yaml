@@ -21,3 +21,11 @@ permits:
 #   directory: transfers  # relative to this configuration directory; outside export
 #   max_bytes: 536870912
 #   max_transfers: 128
+
+# Optional automatic session reconnect, only with outgoing protocol: 2.
+# Attempts are additional sessions; default 0 disables automatic retry.
+# reconnect:
+#   attempts: 3
+#   delay_seconds: 5
+#   max_delay_seconds: 60
+#   max_elapsed_seconds: 3600  # initial attempt, waits and retries combined

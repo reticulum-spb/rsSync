@@ -125,10 +125,11 @@ request/response Resource limits allow 1,024 extra bytes for Reticulum envelopes
 
 Error codes: 1 permission denied, 2 invalid path, 3 changed source/destination,
 4 file hash mismatch, 5 protocol/plan/state error, 6 filesystem error, 7 transport
-error, 8 configuration error. The Rust server truncates error descriptions to 240
+error, 8 configuration error, 9 busy export. The Rust server truncates error descriptions to 240
 Unicode characters. Errors abort that Link's application session; earlier committed
 files are not rolled back. Busy errors from other Links leave the active session
-intact. Callers must fail the run on any ERROR or unexpected response.
+intact. Callers must fail the session on any ERROR or unexpected response; v2 may
+start a fresh session after busy, under its reconnect policy.
 
 Golden payloads (hex): `0107` FINISH; `0108` OK; `010300000002` BEGIN index 2;
 `010200000000` empty MANIFEST.
@@ -296,7 +297,7 @@ request for a Link and cannot change, including after FINISH. A rejected/busy
 request does not release another Link's session. Both engines share one active
 export session; separate v1 and v2 sessions may not mutate the export concurrently.
 The response/error encoding follows the requested path's version. There is no
-capability probing, fallback or automatic reconnect.
+capability probing or fallback. Optional client reconnect is described below.
 
 The client recalls the announced public key, verifies that its identity derives
 the requested `rrsync.sync` destination, and validates native Link establishment
@@ -399,8 +400,38 @@ fresh descriptions. The receiver reports only cached chunks that pass size/hash
 checks. Do not persist/replay pending Resource receipts or session commands.
 Changed identities, paths, source bytes or chunk sizes must not accidentally reuse
 another transfer's state. A lost chunk or file acknowledgement is resolved by
-fresh negotiation, not blind mutation replay. Receiver-state configuration and quotas are described below. Automatic reconnect
-and timed retention are not implemented.
+fresh negotiation, not blind mutation replay. Receiver-state configuration and quotas
+are described below. Timed retention is not implemented.
+
+### Automatic session reconnect
+
+The optional top-level `reconnect` policy is client-local and requires outgoing
+protocol 2. `attempts` is the number of additional sessions (default 0, maximum 32).
+`delay_seconds` defaults to 5; double the delay after each failure, capped by
+`max_delay_seconds` (default 60). Delays must be positive, with initial <= maximum
+and maximum <= 86400 seconds. `max_elapsed_seconds` defaults to 3600, must be
+1–604800, and covers the initial attempt, waits and retries when enabled. This is
+a cooperative asynchronous deadline; synchronous filesystem work is not preempted.
+
+Retry connection loss, discovery/operation timeouts, exhausted native Resource
+sender retries and ERROR code 9 (busy). Other remote codes, explicit access denial,
+invalid Link proofs, protocol/hash/source-change errors and local I/O/config/cache
+failures are terminal. Preserve numeric remote codes; do not classify human error
+text. A peer that reports busy using legacy code 5 is treated as terminal. Native
+Link closure may not reveal its reason, so indistinguishable closures consume the
+bounded retry budget even if the peer rejected authentication.
+
+Every attempt reopens the local root, rescans it, rediscovers/verifies the remote
+identity, opens a new Link, identifies, and starts fresh negotiation with START.
+Do not reuse in-memory manifests, pending receipts or mutation commands. Source
+changes between attempts are reflected in the new scan. Preserve verified cache
+blocks across failures. A lost FILE_COMMIT or FINISH acknowledgement is resolved
+by this comparison of actual state. An exhausted deadline is not evidence that
+the last mutation failed; a later invocation must also rescan.
+
+Retain one Reticulum client runtime across attempts; this policy does not restart
+the daemon. On cancellation, release local pending files/cache locks. Abrupt Link
+deregistration may leave the server busy until its inactivity lease expires.
 
 The engine receives authenticated peer identity and current permission from its
 adapter on every request. An identity change or revoked write permission aborts

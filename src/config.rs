@@ -46,6 +46,7 @@ pub struct Config {
     pub announce_seconds: u64,
     pub protocol: u8,
     pub resume: Option<ResumeConfig>,
+    pub reconnect: crate::reconnect::Policy,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -57,6 +58,7 @@ impl Default for Config {
             announce_seconds: 600,
             protocol: 1,
             resume: None,
+            reconnect: crate::reconnect::Policy::default(),
         }
     }
 }
@@ -103,6 +105,12 @@ impl Config {
             return Err(Error::Config("timeouts must be positive".into()));
         }
         config.identity = directory.join("identity");
+        config.reconnect.validate()?;
+        if config.reconnect.attempts > 0 && config.protocol != 2 {
+            return Err(Error::Config(
+                "automatic reconnect requires protocol 2".into(),
+            ));
+        }
         if !matches!(config.protocol, 1 | 2) || (config.protocol == 2 && config.resume.is_none()) {
             return Err(Error::Config(
                 "protocol must be 1 or 2; protocol 2 requires resume configuration".into(),
@@ -200,6 +208,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         for text in [
             "protocol: 3",
+            "reconnect: {attempts: 1}",
+            "protocol: 2\nresume: {chunk_size: 4096}\nreconnect: {attempts: 33}",
+            "protocol: 2\nresume: {chunk_size: 4096}\nreconnect: {delay_seconds: 0}",
+            "protocol: 2\nresume: {chunk_size: 4096}\nreconnect: {max_elapsed_seconds: 0}",
             "protocol: 2",
             "resume: {}",
             "resume: {chunk_size: 1}",

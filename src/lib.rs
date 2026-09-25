@@ -4,6 +4,7 @@ pub mod config;
 pub mod engine;
 pub mod fs;
 pub mod protocol;
+pub mod reconnect;
 pub mod sync;
 pub mod transport;
 
@@ -23,6 +24,12 @@ pub enum Error {
     HashMismatch(String),
     #[error("transport: {0}")]
     Transport(String),
+    #[error("connection: {0}")]
+    Connection(String),
+    #[error("server export is busy")]
+    Busy,
+    #[error("remote error {code}: {text}")]
+    Remote { code: u8, text: String },
     #[error("configuration: {0}")]
     Config(String),
 }

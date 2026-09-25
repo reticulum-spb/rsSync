@@ -127,13 +127,13 @@ impl SimulatedTransport {
     }
 }
 fn lost() -> Error {
-    Error::Transport("simulated connection interrupted".into())
+    Error::Connection("simulated connection interrupted".into())
 }
 impl SyncTransport for SimulatedTransport {
     async fn request(&mut self, payload: Vec<u8>, deadline: Duration) -> Result<Vec<u8>> {
         tokio::time::timeout(deadline, self.request_inner(payload, deadline))
             .await
-            .map_err(|_| Error::Transport("simulated request timeout".into()))?
+            .map_err(|_| Error::Connection("simulated request timeout".into()))?
     }
     async fn send_file(
         &mut self,

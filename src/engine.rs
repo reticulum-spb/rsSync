@@ -154,7 +154,7 @@ impl Server {
                 return Err(Error::PermissionDenied);
             }
             if self.session.is_some() {
-                return Err(Error::Protocol("server export is busy".into()));
+                return Err(Error::Busy);
             }
             let root = self.root.subtree(&path)?;
             if !push && !root.exists("")? {

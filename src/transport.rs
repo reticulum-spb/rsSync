@@ -25,6 +25,19 @@ fn transport(e: impl std::fmt::Display) -> Error {
     Error::Transport(e.to_string())
 }
 
+fn link_error(error: rns_runtime::link_client::LinkClientError) -> Error {
+    use rns_runtime::link_client::LinkClientError as E;
+    let retryable = matches!(
+        &error,
+        E::TransportUnavailable | E::Timeout(_) | E::PubkeyNotDiscovered | E::HandshakeFailed(_)
+    ) || matches!(&error, E::Resource(text) if text == "resource sender retries exhausted");
+    if retryable {
+        Error::Connection(error.to_string())
+    } else {
+        transport(error)
+    }
+}
+
 pub fn identity(config: &Config, read_only: bool) -> Result<Identity> {
     if config.identity.exists() {
         return Identity::from_file(&config.identity).map_err(transport);
@@ -179,7 +192,7 @@ impl Service {
         self.receive();
         if v2 {
             if self.engine.active() {
-                return Err(Error::Protocol("server export is busy".into()));
+                return Err(Error::Busy);
             }
             let engine = self.v2.as_mut().ok_or_else(|| {
                 Error::Config("v2 is disabled; configure resume on the server".into())
@@ -200,7 +213,7 @@ impl Service {
             }
         } else {
             if self.v2.as_ref().is_some_and(|e| e.active()) {
-                return Err(Error::Protocol("server export is busy".into()));
+                return Err(Error::Busy);
             }
             match self
                 .engine
@@ -386,98 +399,104 @@ pub async fn client(
     path: String,
     options: Options,
 ) -> Result<()> {
-    let local_root = if push {
-        Root::open(local)?
-    } else {
-        Root::destination(local)?
-    };
-    let resume_cache = if config.protocol == 2 {
-        cache(config, &local_root)?
-    } else {
-        None
-    };
-    let scan = sync::scan(&local_root, options.checksum)?;
     let id = identity(config, options.dry_run)?;
     let (runtime, shutdown) = runtime(config, options.dry_run).await?;
     let deadline = Duration::from_secs(config.timeout_seconds);
-    let result = async {
-        runtime
-            .await_path(remote, deadline)
-            .await
-            .map_err(transport)?;
-        let (mut link, peer) = if config.protocol == 2 {
-            use rns_transport::messages::{TransportQuery, TransportQueryResponse};
-            let key = match runtime
-                .query_control(TransportQuery::Recall {
-                    destination_hash: remote,
-                })
+    let result = crate::reconnect::run(&config.reconnect, |_| {
+        let id = id.clone();
+        let path = path.clone();
+        let runtime = &runtime;
+        async move {
+            let local_root = if push {
+                Root::open(local)?
+            } else {
+                Root::destination(local)?
+            };
+            let resume_cache = if config.protocol == 2 {
+                cache(config, &local_root)?
+            } else {
+                None
+            };
+
+            let scan = sync::scan(&local_root, options.checksum)?;
+            runtime
+                .await_path(remote, deadline)
                 .await
-            {
-                Some(TransportQueryResponse::Announce(Some(entry))) => entry.public_key,
-                _ => None,
-            }
-            .ok_or_else(|| Error::Transport("remote identity not discovered".into()))?;
-            let peer = rns_crypto::sha::truncated_hash(&key);
-            if rns_identity::destination::Destination::hash_from_name_and_identity(
-                APP_NAME,
-                Some(&peer),
-            ) != remote
-            {
-                return Err(Error::Transport(
-                    "remote destination identity mismatch".into(),
-                ));
-            }
-            (
-                LinkSession::open_with_public_key(&runtime, id, remote, key, 1, deadline)
+                .map_err(|e| Error::Connection(e.to_string()))?;
+            let (mut link, peer) = if config.protocol == 2 {
+                use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+                let key = match runtime
+                    .query_control(TransportQuery::Recall {
+                        destination_hash: remote,
+                    })
                     .await
-                    .map_err(transport)?,
-                peer,
-            )
-        } else {
-            (
-                LinkSession::open(&runtime, id, remote, 1, deadline)
-                    .await
-                    .map_err(transport)?,
-                [0; 16],
-            )
-        };
-        link.identify().await.map_err(transport)?;
-        let job = engine::SyncRequest {
-            push,
-            path,
-            options,
-            deadline,
-        };
-        let on_plan = |plan: &sync::Plan| {
-            for op in &plan.operations {
-                println!("{:?}\t{}", op.action, op.path);
-            }
-        };
-        if let Some(cache) = resume_cache {
-            v2::synchronize(
-                &mut ReticulumTransport(&mut link, crate::protocol::v2::REQUEST_PATH),
-                &local_root,
-                scan,
-                job,
-                v2::Resume {
-                    cache,
+                {
+                    Some(TransportQueryResponse::Announce(Some(entry))) => entry.public_key,
+                    _ => None,
+                }
+                .ok_or_else(|| Error::Connection("remote identity not discovered".into()))?;
+                let peer = rns_crypto::sha::truncated_hash(&key);
+                if rns_identity::destination::Destination::hash_from_name_and_identity(
+                    APP_NAME,
+                    Some(&peer),
+                ) != remote
+                {
+                    return Err(Error::Transport(
+                        "remote destination identity mismatch".into(),
+                    ));
+                }
+                (
+                    LinkSession::open_with_public_key(runtime, id, remote, key, 1, deadline)
+                        .await
+                        .map_err(link_error)?,
                     peer,
-                    chunk_size: config.resume.as_ref().unwrap().chunk_size,
-                },
-                on_plan,
-            )
-            .await
-        } else {
-            engine::synchronize(
-                &mut ReticulumTransport(&mut link, REQUEST_PATH),
-                &local_root,
-                scan,
-                job,
-                on_plan,
-            )
-            .await
+                )
+            } else {
+                (
+                    LinkSession::open(runtime, id, remote, 1, deadline)
+                        .await
+                        .map_err(link_error)?,
+                    [0; 16],
+                )
+            };
+            link.identify().await.map_err(link_error)?;
+            let job = engine::SyncRequest {
+                push,
+                path,
+                options,
+                deadline,
+            };
+            let on_plan = |plan: &sync::Plan| {
+                for op in &plan.operations {
+                    println!("{:?}\t{}", op.action, op.path);
+                }
+            };
+            if let Some(cache) = resume_cache {
+                v2::synchronize(
+                    &mut ReticulumTransport(&mut link, crate::protocol::v2::REQUEST_PATH),
+                    &local_root,
+                    scan,
+                    job,
+                    v2::Resume {
+                        cache,
+                        peer,
+                        chunk_size: config.resume.as_ref().unwrap().chunk_size,
+                    },
+                    on_plan,
+                )
+                .await
+            } else {
+                engine::synchronize(
+                    &mut ReticulumTransport(&mut link, REQUEST_PATH),
+                    &local_root,
+                    scan,
+                    job,
+                    on_plan,
+                )
+                .await
+            }
         }
-    }
+    })
     .await;
     shutdown.trigger();
     result
@@ -490,7 +509,7 @@ impl SyncTransport for ReticulumTransport<'_> {
             .0
             .request_with_metadata_limit(self.1, Some(&payload), deadline, MAX_CONTROL + 1024)
             .await
-            .map_err(transport)?;
+            .map_err(link_error)?;
         Ok(response.data)
     }
     async fn send_file(
@@ -503,7 +522,7 @@ impl SyncTransport for ReticulumTransport<'_> {
         self.0
             .send_resource_reader(&mut reader, size as usize, None, false, deadline)
             .await
-            .map_err(transport)
+            .map_err(link_error)
     }
     async fn receive_file(
         &mut self,
@@ -514,7 +533,7 @@ impl SyncTransport for ReticulumTransport<'_> {
             .0
             .recv_resource_file(max_size as usize, deadline)
             .await
-            .map_err(transport)?;
+            .map_err(link_error)?;
         Ok(engine::ReceivedFile {
             transfer_id: received.resource_hash,
             file: received.file.into_std().await,
@@ -523,7 +542,7 @@ impl SyncTransport for ReticulumTransport<'_> {
         })
     }
     async fn close(&mut self) -> Result<()> {
-        self.0.close().await.map_err(transport)
+        self.0.close().await.map_err(link_error)
     }
 }
 
@@ -608,6 +627,26 @@ mod tests {
             .request([2; 16], p2, V2::Common(Message::Finish).encode().unwrap())
             .unwrap();
         assert!(!tmp.path().join("cache").exists()); // planning does not create state
+    }
+    #[test]
+    fn native_errors_only_retry_connection_failures() {
+        use rns_runtime::link_client::LinkClientError as E;
+        for error in [
+            E::Timeout("test"),
+            E::HandshakeFailed("link closed".into()),
+            E::Resource("resource sender retries exhausted".into()),
+        ] {
+            assert!(crate::reconnect::retryable(&link_error(error)));
+        }
+        for error in [
+            E::ProofInvalid("test".into()),
+            E::LinkCrypto("test".into()),
+            E::NoSigningKey,
+            E::Resource("resource file write: disk full".into()),
+            E::UnexpectedResponse("malformed".into()),
+        ] {
+            assert!(!crate::reconnect::retryable(&link_error(error)));
+        }
     }
     #[test]
     fn cache_location_is_canonical_and_outside_tree() {

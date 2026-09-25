@@ -108,8 +108,33 @@ and requests only missing or damaged ones. Changed source content, chunk size,
 peer identity or path starts separate state. Every received block and the assembled
 file are checked with SHA-256, including when `--checksum` is absent. The flag
 still controls the initial comparison of existing files. Logs report cached and
-missing chunk counts per file. Automatic reconnect and delta transfer are not
-implemented.
+missing chunk counts per file. Delta transfer is not implemented.
+
+To reconnect automatically, add this top-level section to the client config
+(requires `protocol: 2`):
+
+```yaml
+reconnect:
+  attempts: 3
+  delay_seconds: 5
+  max_delay_seconds: 60
+  max_elapsed_seconds: 3600
+```
+
+`attempts` counts additional sessions (0 by default, at most 32). Delay doubles
+until `max_delay_seconds`; the defaults are 5 and 60 seconds. With retries enabled,
+`max_elapsed_seconds` bounds the initial attempt, waits and subsequent sessions
+(default 3600 seconds). This asynchronous deadline cannot interrupt synchronous
+filesystem work. Delays must be positive, the maximum delay at least the initial
+delay and at most 86400 seconds; the elapsed budget must be 1–604800 seconds.
+
+Connection loss, discovery/operation timeouts and a busy export trigger a fresh
+Link, authentication and directory scan. Explicit access denial, invalid protocol,
+changed files, verification failures and local file/cache errors stop the command.
+Each retry compares current state and verifies cached chunks; uncertain mutations
+are never blindly replayed. The server may remain busy until its inactivity lease
+expires, so allow enough retry time. This recovers application sessions through
+the existing runtime; daemon restart recovery has not been tested.
 
 `max_bytes` defaults to 512 MiB and limits logical cached payload/staging bytes,
 reserving room for the missing blocks of each incoming file. It excludes filesystem
@@ -197,10 +222,12 @@ the server inactivity timeout before retrying. If a commit or final response is
 lost, the receiving side may already have completed that operation. Rerun the
 synchronization to compare actual directory contents; commands are not automatically
 replayed after an uncertain result. Source changes detected during a run
-cause failure. Delta transfer and automatic session reconnection are not implemented.
+cause failure. Optional v2 reconnect performs that fresh synchronization automatically.
+Delta transfer is not implemented.
 
 After a server process exits, restart `serve` with the same configuration directory
-and export directory, then rerun the client command. The saved identity preserves
+and export directory. An enabled v2 reconnect can recover within its retry budget;
+otherwise rerun the client command. The saved identity preserves
 the server destination; completed files remain available for the new comparison.
 
 With `--delete`, replacing a directory by a file first receives and verifies the
