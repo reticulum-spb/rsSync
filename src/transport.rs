@@ -1,9 +1,10 @@
 use crate::{
     Error, Result,
     config::{Config, Permission},
-    fs::{Root, snapshot},
+    engine::{self, SyncTransport},
+    fs::Root,
     protocol::{MAX_CONTROL, Message, REQUEST_PATH},
-    sync::{self, MAX_FILE, Manifest, Options, Plan, Scan},
+    sync::{self, MAX_FILE, Options},
 };
 use rns_identity::identity::Identity;
 use rns_runtime::{
@@ -13,7 +14,7 @@ use rns_runtime::{
     reticulum::{self, ReticulumHandle},
 };
 use std::{
-    collections::{BTreeSet, HashMap},
+    collections::HashMap,
     path::Path,
     sync::{Arc, Mutex, atomic::AtomicBool},
     time::{Duration, Instant},
@@ -77,24 +78,8 @@ pub async fn runtime(
     Ok((handle, shutdown))
 }
 
-struct Session {
-    link: [u8; 16],
-    push: bool,
-    options: Options,
-    root: Root,
-    source: Manifest,
-    destination: Manifest,
-    scan: Scan,
-    plan: Plan,
-    prepared: bool,
-    pending: Option<usize>,
-    received: Option<FileResourceCompletion>,
-    done: BTreeSet<usize>,
-    activity: Instant,
-}
 struct Service {
-    root: Root,
-    session: Option<Session>,
+    engine: engine::Server,
     incoming: mpsc::Receiver<FileResourceCompletion>,
     identities: Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>,
     config: Config,
@@ -102,196 +87,43 @@ struct Service {
 impl Service {
     fn receive(&mut self) {
         while let Ok(file) = self.incoming.try_recv() {
-            if let Some(s) = &mut self.session
-                && s.push
-                && s.link == file.link_id
-                && s.pending.is_some()
-                && s.received.is_none()
-            {
-                s.received = Some(file);
-            }
+            self.engine.receive(
+                file.link_id,
+                engine::ReceivedFile {
+                    transfer_id: file.resource_hash,
+                    file: file.file,
+                    size: file.data_size as u64,
+                    has_metadata: file.metadata.is_some(),
+                },
+            );
         }
     }
     fn request(&mut self, link: [u8; 16], path: [u8; 16], data: Vec<u8>) -> Result<RequestOutcome> {
         if path != rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes()) {
             return Err(Error::Protocol("unknown request path".into()));
         }
-        let authorized = self
+        let permission = self
             .identities
             .lock()
             .unwrap()
             .get(&link)
-            .is_some_and(|id| self.config.permits(id));
-        if !authorized {
-            return Err(Error::PermissionDenied);
-        }
+            .map(|id| self.config.permission(id))
+            .unwrap_or(Permission::Deny);
         self.receive();
-        let request = Message::decode(&data)?;
-        if let Message::Start {
-            push,
-            options,
-            path,
-            manifest,
-        } = request
+        match self
+            .engine
+            .handle(link, permission, Message::decode(&data)?)?
         {
-            if push
-                && self
-                    .identities
-                    .lock()
-                    .unwrap()
-                    .get(&link)
-                    .is_none_or(|id| self.config.permission(id) != Permission::Full)
-            {
-                return Err(Error::PermissionDenied);
-            }
-            if self.session.is_some() {
-                return Err(Error::Protocol("server export is busy".into()));
-            }
-            let root = self.root.subtree(&path)?;
-            if !push && !root.exists("")? {
-                return Err(Error::Io(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "source directory does not exist",
-                )));
-            }
-            let scan = sync::scan(&root, options.checksum)?;
-            let remote = scan.manifest.clone();
-            let (source, destination) = if push {
-                (manifest, remote.clone())
-            } else {
-                (remote.clone(), manifest)
-            };
-            let plan = sync::plan(&source, &destination, options)?;
-            let reply = Message::Manifest(remote).encode()?;
-            self.session = Some(Session {
-                link,
-                push,
-                options,
-                root,
-                source,
-                destination,
-                scan,
-                plan,
-                prepared: false,
-                pending: None,
-                received: None,
-                done: BTreeSet::new(),
-                activity: Instant::now(),
-            });
-            return Ok(RequestOutcome::Reply(reply));
+            engine::ServerReply::Message(message) => Ok(RequestOutcome::Reply(message.encode()?)),
+            engine::ServerReply::File { message, file } => Ok(RequestOutcome::ReplyWithFile {
+                ack: message.encode()?,
+                file: Arc::new(file),
+                metadata: None,
+                auto_compress: false,
+            }),
         }
-        let s = self
-            .session
-            .as_mut()
-            .filter(|s| s.link == link)
-            .ok_or_else(|| Error::Protocol("no active session".into()))?;
-        s.activity = Instant::now();
-        if s.options.dry_run && !matches!(request, Message::Finish) {
-            return Err(Error::Protocol("mutating command in dry-run".into()));
-        }
-        match request {
-            Message::Begin(index) => {
-                let i = index as usize;
-                require_file(s, i, true)?;
-                if s.pending.is_some() {
-                    return Err(Error::Protocol("file already pending".into()));
-                }
-                if !s.prepared {
-                    sync::prepare(&s.root, &s.source, &s.plan)?;
-                    s.prepared = true;
-                }
-                s.pending = Some(i);
-            }
-            Message::Commit { index, resource } => {
-                let i = index as usize;
-                require_file(s, i, true)?;
-                if s.pending != Some(i) {
-                    return Err(Error::Protocol("unexpected file commit".into()));
-                }
-                let mut file = s
-                    .received
-                    .take()
-                    .ok_or_else(|| Error::Protocol("file Resource not received".into()))?;
-                let entry = &s.source.entries[i];
-                if file.resource_hash != resource
-                    || file.data_size as u64 != entry.size
-                    || file.metadata.is_some()
-                {
-                    return Err(Error::Protocol(
-                        "unexpected Resource metadata/hash/size".into(),
-                    ));
-                }
-                sync::install(&s.root, entry, &s.destination, &s.plan, &mut file.file)?;
-                s.pending = None;
-                s.done.insert(i);
-            }
-            Message::Get(index) => {
-                let i = index as usize;
-                require_file(s, i, false)?;
-                if s.pending.is_some() {
-                    return Err(Error::Protocol("file already pending".into()));
-                }
-                let e = &s.source.entries[i];
-                let stamp = &s.scan.stamps[&e.path];
-                let file = snapshot(&s.root, &e.path, stamp)?;
-                s.pending = Some(i);
-                return Ok(RequestOutcome::ReplyWithFile {
-                    ack: Message::Ok.encode()?,
-                    file: Arc::new(file),
-                    metadata: None,
-                    auto_compress: false,
-                });
-            }
-            Message::Verified(index) => {
-                let i = index as usize;
-                require_file(s, i, false)?;
-                if s.pending != Some(i) {
-                    return Err(Error::Protocol("unexpected verification".into()));
-                }
-                let e = &s.source.entries[i];
-                sync::ensure_unchanged(&s.root, &e.path, &s.scan.stamps[&e.path])?;
-                s.pending = None;
-                s.done.insert(i);
-            }
-            Message::Finish => {
-                if !s.options.dry_run {
-                    if s.pending.is_some() || s.done.len() != s.plan.files.len() {
-                        return Err(Error::Protocol("unfinished file transfers".into()));
-                    }
-                    if s.push {
-                        if !s.prepared {
-                            sync::prepare(&s.root, &s.source, &s.plan)?;
-                        }
-                        sync::finish(&s.root, &s.source, &s.plan)?;
-                    } else {
-                        check_source(&s.root, &s.scan)?;
-                    }
-                }
-                self.session = None;
-            }
-            _ => return Err(Error::Protocol("unexpected request".into())),
-        }
-        Ok(RequestOutcome::Reply(Message::Ok.encode()?))
     }
 }
-fn require_file(s: &Session, index: usize, push: bool) -> Result<()> {
-    if s.push != push || !s.plan.files.contains(&index) || s.done.contains(&index) {
-        return Err(Error::Protocol("file not in pending plan".into()));
-    }
-    Ok(())
-}
-fn check_source(root: &Root, scan: &Scan) -> Result<()> {
-    if let Some(stamp) = scan.stamps.get("") {
-        sync::ensure_unchanged(root, "", stamp)?;
-    }
-    for e in &scan.manifest.entries {
-        if e.kind != sync::Kind::Protected {
-            sync::ensure_unchanged(root, &e.path, &scan.stamps[&e.path])?;
-        }
-    }
-    Ok(())
-}
-
 pub async fn serve(config: Config, root: Root) -> Result<()> {
     let id = identity(&config, false)?;
     let (runtime, shutdown) = runtime(&config, false).await?;
@@ -325,8 +157,7 @@ pub async fn serve_on(
     let gate = config.clone();
     manager.set_link_identity_gate(move |_, id| gate.permits(&id));
     let service = Arc::new(Mutex::new(Service {
-        root,
-        session: None,
+        engine: engine::Server::new(root),
         incoming: file_rx,
         identities,
         config: config.clone(),
@@ -338,9 +169,7 @@ pub async fn serve_on(
             Ok(reply) => reply,
             Err(e) => {
                 tracing::warn!(error=%e,"sync request failed");
-                if state.session.as_ref().is_some_and(|s| s.link == link) {
-                    state.session = None;
-                }
+                state.engine.disconnect(link);
                 RequestOutcome::Reply(Message::error(&e).encode().expect("bounded error"))
             }
         }
@@ -368,16 +197,14 @@ pub async fn serve_on(
                 manager.tick();
                 let expired={
                     let mut state=service.lock().unwrap(); state.receive();
-                    if state.session.as_ref().is_some_and(|s| s.activity.elapsed() > Duration::from_secs(config.timeout_seconds)) {
-                        state.session.take().map(|s| s.link)
-                    } else { None }
+                    state.engine.expire(Instant::now(), Duration::from_secs(config.timeout_seconds))
                 };
                 if let Some(link_id)=expired {
                     event_tx.send(rns_transport::link_messages::DestinationEvent::LinkClosed {link_id}).await.map_err(transport)?;
                     manager.try_step();
                 }
             },
-            Some(link)=closed_rx.recv()=>{ let mut s=service.lock().unwrap(); if s.session.as_ref().is_some_and(|s| s.link == link) {s.session=None;} },
+            Some(link)=closed_rx.recv()=>{ let mut s=service.lock().unwrap(); s.engine.disconnect(link); },
         }
     }
     Ok(())
@@ -421,13 +248,7 @@ fn admit(
     if !authorized {
         return false;
     }
-    if let Some(s) = state
-        .session
-        .as_mut()
-        .filter(|s| s.link == header.destination_hash)
-    {
-        s.activity = Instant::now();
-    }
+    state.engine.touch(header.destination_hash, Instant::now());
     if header.context == C::ResourceAdv {
         let Some(link) = manager.get_link(&header.destination_hash) else {
             return false;
@@ -444,38 +265,13 @@ fn admit(
         if adv.flags.is_response {
             return false;
         }
-        let Some(s) = &state.session else {
-            return false;
-        };
-        let Some(index) = s.pending else {
-            return false;
-        };
-        return s.link == header.destination_hash
-            && s.push
-            && !s.options.dry_run
-            && adv.data_size == s.source.entries[index].size as usize
-            && !adv.flags.has_metadata;
+        return state.engine.accepts_file(
+            header.destination_hash,
+            adv.data_size as u64,
+            adv.flags.has_metadata,
+        );
     }
     true
-}
-
-async fn request(link: &mut LinkSession, message: Message, deadline: Duration) -> Result<Message> {
-    let bytes = message.encode()?;
-    let response = link
-        .request_with_metadata_limit(REQUEST_PATH, Some(&bytes), deadline, MAX_CONTROL + 1024)
-        .await
-        .map_err(transport)?;
-    let result = Message::decode(&response.data)?;
-    if let Message::Error { code, text } = result {
-        return Err(Error::Protocol(format!("remote error {code}: {text}")));
-    }
-    Ok(result)
-}
-async fn ok(link: &mut LinkSession, message: Message, deadline: Duration) -> Result<()> {
-    if !matches!(request(link, message, deadline).await?, Message::Ok) {
-        return Err(Error::Protocol("expected OK".into()));
-    }
-    Ok(())
 }
 
 pub async fn client(
@@ -504,277 +300,69 @@ pub async fn client(
             .await
             .map_err(transport)?;
         link.identify().await.map_err(transport)?;
-        let result = sync_link(&mut link, push, &local_root, scan, path, options, deadline).await;
-        let _ = link.close().await;
-        result
+        engine::synchronize(
+            &mut ReticulumTransport(&mut link),
+            &local_root,
+            scan,
+            engine::SyncRequest {
+                push,
+                path,
+                options,
+                deadline,
+            },
+            |plan| {
+                for op in &plan.operations {
+                    println!("{:?}\t{}", op.action, op.path);
+                }
+            },
+        )
+        .await
     }
     .await;
     shutdown.trigger();
     result
 }
-pub async fn sync_link(
-    link: &mut LinkSession,
-    push: bool,
-    root: &Root,
-    scan: Scan,
-    path: String,
-    options: Options,
-    deadline: Duration,
-) -> Result<()> {
-    let reply = request(
-        link,
-        Message::Start {
-            push,
-            options,
-            path,
-            manifest: scan.manifest.clone(),
-        },
-        deadline,
-    )
-    .await?;
-    let Message::Manifest(remote) = reply else {
-        return Err(Error::Protocol("expected manifest".into()));
-    };
-    let (source, destination) = if push {
-        (&scan.manifest, &remote)
-    } else {
-        (&remote, &scan.manifest)
-    };
-    let plan = sync::plan(source, destination, options)?;
-    for op in &plan.operations {
-        println!("{:?}\t{}", op.action, op.path);
-    }
-    if options.dry_run {
-        return ok(link, Message::Finish, deadline).await;
-    }
-    if !push {
-        sync::prepare(root, source, &plan)?;
-    }
-    for &index in &plan.files {
-        let e = &source.entries[index];
-        if push {
-            let file = snapshot(root, &e.path, &scan.stamps[&e.path])?;
-            ok(link, Message::Begin(index as u32), deadline).await?;
-            let mut reader = tokio::fs::File::from_std(file);
-            let resource = link
-                .send_resource_reader(&mut reader, e.size as usize, None, false, deadline)
-                .await
-                .map_err(transport)?;
-            sync::ensure_unchanged(root, &e.path, &scan.stamps[&e.path])?;
-            ok(
-                link,
-                Message::Commit {
-                    index: index as u32,
-                    resource,
-                },
-                deadline,
-            )
-            .await?;
-        } else {
-            ok(link, Message::Get(index as u32), deadline).await?;
-            let received = link
-                .recv_resource_file(e.size as usize, deadline)
-                .await
-                .map_err(transport)?;
-            if received.data_size as u64 != e.size || received.metadata.is_some() {
-                return Err(Error::Protocol("unexpected file Resource".into()));
-            }
-            let mut file = received.file.into_std().await;
-            ok(link, Message::Verified(index as u32), deadline).await?;
-            sync::install(root, e, destination, &plan, &mut file)?;
-        }
-    }
-    if push {
-        check_source(root, &scan)?;
-    }
-    ok(link, Message::Finish, deadline).await?;
-    if !push {
-        sync::finish(root, source, &plan)?;
-    }
-    Ok(())
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    fn service(root: Root) -> (Service, mpsc::Sender<FileResourceCompletion>) {
-        let (tx, rx) = mpsc::channel(2);
-        let link = [1; 16];
-        let id = [2; 16];
-        let config = Config {
-            permits: vec![std::collections::BTreeMap::from([(
-                hex::encode(id),
-                Permission::Full,
-            )])],
-            ..Default::default()
-        };
-        let identities = Arc::new(Mutex::new(HashMap::from([(link, id)])));
-        (
-            Service {
-                root,
-                session: None,
-                incoming: rx,
-                identities,
-                config,
-            },
-            tx,
-        )
+struct ReticulumTransport<'a>(&'a mut LinkSession);
+impl SyncTransport for ReticulumTransport<'_> {
+    async fn request(&mut self, payload: Vec<u8>, deadline: Duration) -> Result<Vec<u8>> {
+        let response = self
+            .0
+            .request_with_metadata_limit(REQUEST_PATH, Some(&payload), deadline, MAX_CONTROL + 1024)
+            .await
+            .map_err(transport)?;
+        Ok(response.data)
     }
-    fn call(s: &mut Service, message: Message) -> Result<Message> {
-        let response = s.request(
-            [1; 16],
-            rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes()),
-            message.encode()?,
-        )?;
-        let RequestOutcome::Reply(bytes) = response else {
-            panic!("unexpected file response")
-        };
-        Message::decode(&bytes)
+    async fn send_file(
+        &mut self,
+        file: std::fs::File,
+        size: u64,
+        deadline: Duration,
+    ) -> Result<engine::TransferId> {
+        let mut reader = tokio::fs::File::from_std(file);
+        self.0
+            .send_resource_reader(&mut reader, size as usize, None, false, deadline)
+            .await
+            .map_err(transport)
     }
-    #[test]
-    fn dry_run_refuses_mutations_and_preserves_missing_root() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut s, _) = service(Root::open(temp.path()).unwrap());
-        assert!(matches!(
-            call(
-                &mut s,
-                Message::Start {
-                    push: true,
-                    options: Options {
-                        dry_run: true,
-                        ..Default::default()
-                    },
-                    path: "missing".into(),
-                    manifest: Manifest::default()
-                }
-            )
-            .unwrap(),
-            Message::Manifest(_)
-        ));
-        assert!(call(&mut s, Message::Begin(0)).is_err());
-        call(&mut s, Message::Finish).unwrap();
-        assert!(!temp.path().join("missing").exists());
-    }
-    #[test]
-    fn partial_upload_requires_resource_and_commit_before_delete() {
-        let source = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        std::fs::write(source.path().join("file"), b"new data").unwrap();
-        std::fs::write(target.path().join("file"), b"old").unwrap();
-        std::fs::write(target.path().join("extra"), b"extra").unwrap();
-        let m = sync::scan(&Root::open(source.path()).unwrap(), false)
-            .unwrap()
-            .manifest;
-        let (mut s, tx) = service(Root::open(target.path()).unwrap());
-        call(
-            &mut s,
-            Message::Start {
-                push: true,
-                options: Options {
-                    delete: true,
-                    ..Default::default()
-                },
-                path: String::new(),
-                manifest: m,
-            },
-        )
-        .unwrap();
-        assert!(call(&mut s, Message::Finish).is_err());
-        call(&mut s, Message::Begin(0)).unwrap();
-        assert!(
-            call(
-                &mut s,
-                Message::Commit {
-                    index: 0,
-                    resource: [3; 32]
-                }
-            )
-            .is_err()
-        );
-        assert_eq!(std::fs::read(target.path().join("file")).unwrap(), b"old");
-        assert!(target.path().join("extra").exists());
-        tx.try_send(FileResourceCompletion {
-            link_id: [1; 16],
-            resource_hash: [3; 32],
-            file: std::fs::File::open(source.path().join("file")).unwrap(),
-            data_size: 8,
-            metadata: None,
+    async fn receive_file(
+        &mut self,
+        max_size: u64,
+        deadline: Duration,
+    ) -> Result<engine::ReceivedFile> {
+        let received = self
+            .0
+            .recv_resource_file(max_size as usize, deadline)
+            .await
+            .map_err(transport)?;
+        Ok(engine::ReceivedFile {
+            transfer_id: received.resource_hash,
+            file: received.file.into_std().await,
+            size: received.data_size as u64,
+            has_metadata: received.metadata.is_some(),
         })
-        .unwrap();
-        call(
-            &mut s,
-            Message::Commit {
-                index: 0,
-                resource: [3; 32],
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            std::fs::read(target.path().join("file")).unwrap(),
-            b"new data"
-        );
-        assert!(target.path().join("extra").exists());
-        assert!(call(&mut s, Message::Begin(0)).is_err());
-        call(&mut s, Message::Finish).unwrap();
-        assert!(!target.path().join("extra").exists());
     }
-    #[test]
-    fn read_only_identity_can_pull_but_cannot_push() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut s, _) = service(Root::open(temp.path()).unwrap());
-        s.config.permits = vec![std::collections::BTreeMap::from([(
-            "others".into(),
-            Permission::Read,
-        )])];
-        for dry_run in [false, true] {
-            let result = call(
-                &mut s,
-                Message::Start {
-                    push: true,
-                    options: Options {
-                        dry_run,
-                        ..Default::default()
-                    },
-                    path: "missing".into(),
-                    manifest: Manifest::default(),
-                },
-            );
-            assert!(matches!(result, Err(Error::PermissionDenied)));
-            assert!(s.session.is_none());
-        }
-        call(
-            &mut s,
-            Message::Start {
-                push: false,
-                options: Options::default(),
-                path: String::new(),
-                manifest: Manifest::default(),
-            },
-        )
-        .unwrap();
-        call(&mut s, Message::Finish).unwrap();
-        assert!(!temp.path().join("missing").exists());
-    }
-    #[test]
-    fn unauthorized_and_busy_sessions_do_not_access_export() {
-        let temp = tempfile::tempdir().unwrap();
-        let (mut s, _) = service(Root::open(temp.path()).unwrap());
-        let start = || Message::Start {
-            push: true,
-            options: Options::default(),
-            path: "new".into(),
-            manifest: Manifest::default(),
-        };
-        assert!(matches!(
-            s.request(
-                [9; 16],
-                rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes()),
-                start().encode().unwrap()
-            ),
-            Err(Error::PermissionDenied)
-        ));
-        call(&mut s, start()).unwrap();
-        assert!(call(&mut s, start()).is_err());
-        assert!(!temp.path().join("new").exists());
+    async fn close(&mut self) -> Result<()> {
+        self.0.close().await.map_err(transport)
     }
 }

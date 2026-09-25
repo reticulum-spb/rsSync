@@ -1,5 +1,6 @@
 #![cfg(target_os = "linux")]
 pub mod config;
+pub mod engine;
 pub mod fs;
 pub mod protocol;
 pub mod sync;
