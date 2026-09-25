@@ -19,7 +19,11 @@ fn context() -> [u8; 32] {
     scope([7; 16], true, "/export", "file").unwrap()
 }
 fn chunk_dir(path: &std::path::Path) -> std::path::PathBuf {
-    fs::read_dir(path).unwrap().next().unwrap().unwrap().path()
+    fs::read_dir(path)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap()
 }
 fn fill(store: &Store, data: &[u8]) {
     for (index, part) in data.chunks(MIN_CHUNK_SIZE as usize).enumerate() {
@@ -120,7 +124,7 @@ fn killed_writer_leaves_only_verified_chunks_available() {
     store.receive(2, &mut Cursor::new(&data[8192..])).unwrap();
     assert_eq!(assembled(&store), data);
     store.clear().unwrap();
-    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 1); // lock only
+    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 2); // lock and activity
 }
 
 #[test]
@@ -138,7 +142,7 @@ fn failed_or_duplicate_receive_preserves_verified_state() {
     fill(&store, &data);
     assert!(store.missing().unwrap().is_empty());
     assert_eq!(assembled(&store), data);
-    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 4);
+    assert_eq!(fs::read_dir(chunk_dir(tmp.path())).unwrap().count(), 5);
 }
 
 #[test]
@@ -267,6 +271,7 @@ fn cache_quota_reserves_missing_bytes_and_excludes_concurrent_owners() {
     let limits = Limits {
         max_bytes: data.len() as u64,
         max_transfers: 4,
+        retention_seconds: 0,
     };
     let store = Store::open_limited(tmp.path(), context(), d.clone(), limits).unwrap();
     assert!(Store::open_limited(tmp.path(), [9; 32], d.clone(), limits).is_err());
@@ -283,7 +288,8 @@ fn cache_quota_reserves_missing_bytes_and_excludes_concurrent_owners() {
             d.clone(),
             Limits {
                 max_bytes: 100000,
-                max_transfers: 1
+                max_transfers: 1,
+                retention_seconds: 0
             }
         )
         .is_err()
@@ -292,4 +298,31 @@ fn cache_quota_reserves_missing_bytes_and_excludes_concurrent_owners() {
     fill(&store, &data);
     assert_eq!(assembled(&store), data);
     store.clear().unwrap();
+}
+
+#[test]
+fn expiry_rejects_symlinks_without_deleting_cached_or_external_data() {
+    use rrsync::chunks::Limits;
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let external = outside.path().join("payload");
+    fs::write(&external, b"outside").unwrap();
+    let data = bytes();
+    let d = description(&data, 4096);
+    let store = Store::open(tmp.path(), context(), d.clone()).unwrap();
+    fill(&store, &data);
+    drop(store);
+    let dir = chunk_dir(tmp.path());
+    let mut activity = b"RRSYNC01".to_vec();
+    activity.extend(1u64.to_be_bytes());
+    fs::write(dir.join("activity"), activity).unwrap();
+    symlink(&external, dir.join("00000003.chunk")).unwrap();
+    let limits = Limits {
+        max_bytes: 100000,
+        max_transfers: 4,
+        retention_seconds: 1,
+    };
+    assert!(Store::open_limited(tmp.path(), [9; 32], d, limits).is_err());
+    assert_eq!(fs::read(&external).unwrap(), b"outside");
+    assert_eq!(fs::read(dir.join("00000000.chunk")).unwrap(), &data[..4096]);
 }

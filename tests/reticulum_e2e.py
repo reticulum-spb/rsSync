@@ -122,7 +122,18 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
                 shutil.copyfile(client_config/'identity', legacy/'identity')
                 subprocess.run([binary, '--config', str(legacy), 'push', '--dry-run', str(source), remote],
                                check=True, capture_output=True, text=True, timeout=150)
+            if args.protocol == 2:
+                # Inactive receiver state must expire before accepting new data.
+                for config in (server_config, client_config):
+                    stale = config/'transfers'/('0'*64)
+                    stale.mkdir(parents=True)
+                    (stale/'lock').touch()
+                    (stale/'activity').write_bytes(b'RRSYNC01' + (1).to_bytes(8, 'big'))
+                    (stale/'00000000.chunk').write_bytes(b'old cached bytes')
             cli('push','--checksum',source,remote)
+            if args.protocol == 2:
+                assert not (server_config/'transfers'/('0'*64)).exists()
+
             assert contents(source)==contents(export/'backup'), 'initial push mismatch'
             repeat = cli('push','--checksum',source,remote)
             assert 'Create\t' not in repeat and 'Update\t' not in repeat, repeat
@@ -138,6 +149,8 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
             local = root/'download'/'nested'
             cli('pull','--checksum',remote,local)
             assert contents(source)==contents(local), 'pull mismatch'
+            if args.protocol == 2:
+                assert not (client_config/'transfers'/('0'*64)).exists()
             (local/'extra-local').write_bytes(b'local extra')
             local_before=contents(local)
             cli('pull','--dry-run','--delete',remote,local)

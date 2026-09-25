@@ -24,7 +24,11 @@ fn context() -> [u8; 32] {
     scope([11; 16], true, "/export", "payload").unwrap()
 }
 fn directory(root: &Path) -> std::path::PathBuf {
-    fs::read_dir(root).unwrap().next().unwrap().unwrap().path()
+    fs::read_dir(root)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.is_dir())
+        .unwrap()
 }
 
 #[test]
@@ -124,7 +128,7 @@ fn persistent_chunks_on_selected_filesystem() {
     let store = Store::open(&state, context(), description).unwrap();
     assert!(store.missing().unwrap().is_empty());
     store.clear().unwrap();
-    assert_eq!(fs::read_dir(directory(&state)).unwrap().count(), 1);
+    assert_eq!(fs::read_dir(directory(&state)).unwrap().count(), 2);
 }
 
 #[test]
@@ -141,6 +145,7 @@ fn quota_and_cache_lock_on_selected_filesystem() {
     let limits = Limits {
         max_bytes: bytes.len() as u64,
         max_transfers: 4,
+        retention_seconds: 0,
     };
     let store = Store::open_limited(fixture.path(), context(), d.clone(), limits).unwrap();
     store

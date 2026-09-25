@@ -9,6 +9,7 @@ use std::{
     fs::File,
     io::{Read, Seek, Write},
     path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 // Safety bounds, not a default or performance recommendation.
@@ -137,12 +138,14 @@ pub struct Store {
     root: Root,
     description: Description,
     _lock: File,
-    _cache_lock: Option<File>,
+    _cache_lock: File,
 }
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_bytes: u64,
     pub max_transfers: usize,
+    /// Expire other inactive transfers before quota checks; zero disables eviction.
+    pub retention_seconds: u64,
 }
 impl Store {
     /// Reserve space for all missing chunks while exclusively owning this cache.
@@ -156,6 +159,9 @@ impl Store {
         let root = Root::open(directory)?;
         let lock = root.lock_state("cache.lock")?;
         let key = description.key(scope);
+        if limits.retention_seconds > 0 {
+            expire(&root, &key, limits.retention_seconds, now()?)?;
+        }
         let mut bytes = 0u64;
         let mut transfers = 0usize;
         let mut found = false;
@@ -175,7 +181,7 @@ impl Store {
                 if !meta.is_file() {
                     return Err(Error::Config("unsupported object in chunk cache".into()));
                 }
-                if child != "lock" {
+                if child != "lock" && child != "activity" {
                     bytes = bytes
                         .checked_add(meta.len())
                         .ok_or_else(|| Error::Config("cache size overflow".into()))?;
@@ -187,7 +193,7 @@ impl Store {
                 "chunk cache quota exceeded; clean stale state while all users are stopped".into(),
             ));
         }
-        let mut store = Self::open(directory, scope, description)?;
+        let store = Self::open_locked(&root, scope, description, lock)?;
         let needed = store
             .missing()?
             .into_iter()
@@ -197,20 +203,29 @@ impl Store {
         if needed > limits.max_bytes - bytes {
             return Err(Error::Config("chunk cache byte quota exceeded".into()));
         }
-        store._cache_lock = Some(lock);
         Ok(store)
     }
     pub fn open(directory: &Path, scope: [u8; 32], description: Description) -> Result<Self> {
         let parent = Root::open(directory)?;
+        let lock = parent.lock_state_shared("cache.lock")?;
+        Self::open_locked(&parent, scope, description, lock)
+    }
+    fn open_locked(
+        parent: &Root,
+        scope: [u8; 32],
+        description: Description,
+        cache_lock: File,
+    ) -> Result<Self> {
         let key = description.key(scope);
         parent.mkdir(&key)?;
         let root = parent.subtree(&key)?;
         let lock = root.lock_state("lock")?;
+        write_activity(&root, now()?)?;
         Ok(Self {
             root,
             description,
             _lock: lock,
-            _cache_lock: None,
+            _cache_lock: cache_lock,
         })
     }
     fn name(&self, index: usize) -> Result<String> {
@@ -253,7 +268,8 @@ impl Store {
                 self.description.length(index)?,
                 self.description.hashes[index],
             )?
-            .commit()
+            .commit()?;
+        write_activity(&self.root, now()?)
     }
     /// Assemble to an anonymous file, verifying chunks and the full digest again.
     /// Installation/mtime/deletion remain the sync engine's responsibility.
@@ -284,7 +300,7 @@ impl Store {
     /// Keep the lock inode and directory so another owner cannot bypass flock.
     pub fn clear(&self) -> Result<()> {
         for (name, metadata) in self.root.children("")? {
-            if name == "lock" {
+            if name == "lock" || name == "activity" {
                 continue;
             }
             let chunk_name = name
@@ -294,6 +310,99 @@ impl Store {
                 self.root.remove(&name, false)?;
             }
         }
-        Ok(())
+        write_activity(&self.root, now()?)
+    }
+}
+
+// Activity is an atomic, fixed-size content record, independent of filesystem mtime.
+fn now() -> Result<u64> {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .map_err(|_| Error::Config("system clock is before Unix epoch".into()))
+}
+fn write_activity(root: &Root, seconds: u64) -> Result<()> {
+    let mut record = *b"RRSYNC01\0\0\0\0\0\0\0\0";
+    record[8..].copy_from_slice(&seconds.to_be_bytes());
+    root.stage_content(
+        "activity",
+        &mut &record[..],
+        16,
+        Sha256::digest(record).into(),
+    )?
+    .commit()
+}
+fn read_activity(root: &Root) -> Result<Option<u64>> {
+    let mut file = match root.open_file("activity") {
+        Ok(file) => file,
+        Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() != 16 {
+        return Ok(None);
+    }
+    let mut record = [0; 16];
+    file.read_exact(&mut record)?;
+    if &record[..8] != b"RRSYNC01" {
+        return Ok(None);
+    }
+    Ok(Some(u64::from_be_bytes(record[8..].try_into().unwrap())))
+}
+fn chunk_name(name: &str) -> bool {
+    name.strip_suffix(".chunk")
+        .is_some_and(|s| s.len() == 8 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+}
+/// Caller owns the cache-wide exclusive lock. All Store open paths participate.
+fn expire(parent: &Root, current: &str, retention: u64, now: u64) -> Result<()> {
+    for (name, metadata) in parent.children("")? {
+        if name == "cache.lock" || name == current {
+            continue;
+        }
+        if name.len() != 64 || !name.bytes().all(|b| b.is_ascii_hexdigit()) || !metadata.is_dir() {
+            return Err(Error::Config("unexpected object in chunk cache".into()));
+        }
+        let root = parent.subtree(&name)?;
+        let _lock = root.lock_state("lock")?;
+        let entries = root.children("")?;
+        // Validate the entire directory before deleting any of its contents.
+        if entries.iter().any(|(name, meta)| {
+            !meta.is_file()
+                || !(name == "lock"
+                    || name == "activity"
+                    || chunk_name(name)
+                    || name.starts_with(".rrsync-"))
+        }) {
+            return Err(Error::Config(
+                "unexpected object in expiring chunk cache".into(),
+            ));
+        }
+        let Some(last) = read_activity(&root)? else {
+            tracing::warn!(transfer=%name, "missing or invalid cache activity; starting retention period");
+            write_activity(&root, now)?;
+            continue;
+        };
+        // Future dates (clock rollback) are retained; no subtraction overflow.
+        if now.checked_sub(last).is_none_or(|age| age < retention) {
+            continue;
+        }
+        for (child, _) in &entries {
+            if child != "lock" && child != "activity" {
+                root.remove(child, false)?;
+            }
+        }
+        // Remove the activity record last so interrupted cleanup can be resumed.
+        root.remove("activity", false)?;
+        root.remove("lock", false)?;
+        parent.remove(&name, true)?;
+        tracing::info!(transfer=%name, "expired inactive chunk cache");
+    }
+    Ok(())
+}
+impl Drop for Store {
+    fn drop(&mut self) {
+        // Both locks are still held. Failed/aborted transfers get a fresh grace period.
+        if let Err(error) = now().and_then(|time| write_activity(&self.root, time)) {
+            tracing::warn!(%error, "could not update cache activity on close");
+        }
     }
 }

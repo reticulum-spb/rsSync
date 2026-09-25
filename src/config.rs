@@ -16,6 +16,11 @@ pub struct ResumeConfig {
     pub max_bytes: u64,
     #[serde(default = "cache_transfers")]
     pub max_transfers: usize,
+    #[serde(default = "cache_retention")]
+    pub retention_seconds: u64,
+}
+fn cache_retention() -> u64 {
+    7 * 24 * 60 * 60
 }
 fn cache_directory() -> PathBuf {
     "transfers".into()
@@ -231,6 +236,7 @@ mod tests {
         let resume = config.resume.unwrap();
         assert_eq!(resume.directory, tmp.path().join("transfers"));
         assert_eq!(resume.max_bytes, 512 * 1024 * 1024);
+        assert_eq!(resume.retention_seconds, 604800);
         assert!(!resume.directory.exists());
     }
     #[test]

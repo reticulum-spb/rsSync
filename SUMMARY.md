@@ -401,7 +401,7 @@ checks. Do not persist/replay pending Resource receipts or session commands.
 Changed identities, paths, source bytes or chunk sizes must not accidentally reuse
 another transfer's state. A lost chunk or file acknowledgement is resolved by
 fresh negotiation, not blind mutation replay. Receiver-state configuration and quotas
-are described below. Timed retention is not implemented.
+are described below, including expiry of inactive receiver state.
 
 ### Automatic session reconnect
 
@@ -461,13 +461,46 @@ space needed for missing chunks before accepting new data. Reject quota violatio
 without deleting another transfer's data. An additional per-transfer lock protects
 the individual description. Hold both until file completion or session teardown;
 process termination releases them. The byte limit excludes native Resource and
-assembly/snapshot temporary storage and filesystem allocation overhead.
+assembly/snapshot temporary storage, lock/activity records and filesystem allocation overhead.
 
 Directory-count limits include retained empty lock directories. Successful file
-installation evicts its chunks; stale state and lock directories currently require
-manual cleanup with all cache users stopped. No filesystem timestamps are used to
-validate chunks or determine expiry. All adapter cache users must obey the same
-cache-wide lock; do not mix unrestricted storage-library access with live sessions.
+installation evicts its chunks. `resume.retention_seconds` defaults to 604800;
+zero disables expiry. Before opening a receiving transfer and checking quotas,
+remove other expired transfer directories, including chunks, abandoned staging,
+activity and lock files. Never expire the currently requested description: rehash
+its chunks and resume. No background sweep is performed; idle caches and dry-run
+are unchanged. Cache expiry changes no wire fields and requires no peer support.
+
+All storage users must acquire `cache.lock` before opening a transfer directory:
+limited/adapter users take an exclusive nonblocking flock for their entire lifetime;
+unrestricted library stores take a shared nonblocking flock, also for their entire
+lifetime. Then acquire the per-transfer exclusive nonblocking `lock`. Hold the
+cache lock until after releasing the transfer lock. Cleanup owns the exclusive
+cache lock and each candidate transfer lock. Only under that exclusion may it
+unlink a transfer lock and remove its directory. Never unlink `cache.lock`.
+Stop all old processes before upgrading from implementations that do not follow
+this locking order. Unknown objects or unsafe paths fail cleanup of the affected
+transfer without deleting any of its contents; no symlinks are followed.
+
+The Rust local activity record is `activity`: exactly 16 bytes, ASCII `RRSYNC01`
+followed by an unsigned big-endian u64 Unix timestamp in seconds. Write through
+same-directory staging, fsync, atomic rename and directory fsync, without setting
+mtime. Refresh on opening the store, after successful chunk publication, on clear,
+and best-effort on normal close/error unwinding while both locks are still held.
+A killed process retains its last published timestamp. Activity records do not
+prove chunk validity; always rehash chunks. No filesystem timestamp is used for
+validation or retention, so this works on VFAT without precise timestamp support.
+
+While sweeping, a missing or malformed activity record is initialized to the current
+time and granted a full retention period (including legacy caches). Retain future
+timestamps after clock rollback. Expire when `now >= last` and `now - last >=
+retention_seconds`. A forward clock jump can evict inactive state early; content
+must then be retransferred. Before deletion validate all entries in that transfer:
+regular `lock`, `activity`, eight-hex-digit `.chunk` names, or `.rrsync-` staging
+files only. Delete payload/staging first, activity next, lock last, then the empty
+directory, syncing each removal. Interrupted cleanup is safe to revisit; if the
+activity record was already removed, grant a new retention period. Manual cleanup
+still requires all cache users to be stopped.
 
 ### Fixed v2 encoding examples
 

@@ -21,6 +21,7 @@ permits:
 #   directory: transfers  # relative to this configuration directory; outside export
 #   max_bytes: 536870912
 #   max_transfers: 128
+#   retention_seconds: 604800  # 7 days; 0 disables cleanup of inactive transfers
 
 # Optional automatic session reconnect, only with outgoing protocol: 2.
 # Attempts are additional sessions; default 0 disables automatic retry.

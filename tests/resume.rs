@@ -476,10 +476,9 @@ async fn persisted_corruption_and_missing_close_require_revalidation_and_lease()
     );
     let transfer = fs::read_dir(&f.server_cache.directory)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
     fs::write(transfer.join("00000000.chunk"), vec![0; 4096]).unwrap();
     let mut retry = f.link();
     f.run(&mut retry, true, false).await.unwrap();

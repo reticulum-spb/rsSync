@@ -88,6 +88,7 @@ resume:
   directory: transfers
   max_bytes: 536870912
   max_transfers: 128
+  retention_seconds: 604800
 ```
 
 The client selects `chunk_size` for both directions. It is required and has no
@@ -138,17 +139,31 @@ the existing runtime; daemon restart recovery has not been tested.
 
 `max_bytes` defaults to 512 MiB and limits logical cached payload/staging bytes,
 reserving room for the missing blocks of each incoming file. It excludes filesystem
-allocation overhead, native Resource temporary files and assembled snapshots.
+allocation overhead, lock/activity records, native Resource temporary files and assembled snapshots.
 `max_transfers` defaults to 128 and limits retained transfer directories, including
 empty lock directories after successful transfers. Both limits must be positive;
 `max_transfers` must be below 16,384. Exceeding a limit fails without evicting other
 transfers. One receiving transfer owns a cache directory at a time.
 
-Successful installation removes cached blocks. Interrupted state is retained;
-there is no automatic expiry yet. To reclaim stale state and empty lock directories,
-stop every rrsync process using that cache, remove its contents, then restart.
-Never remove lock files while a cache user is running. Use a private cache
-location (appropriate mount permissions on VFAT).
+Successful installation removes cached blocks. `retention_seconds` defaults to
+604800 (7 days); 0 disables automatic expiry. Before opening a receiving transfer,
+rrsync removes expired state for other transfers, including abandoned staging files
+and empty lock directories, before checking quotas. This is cleanup on use, not a
+background timer: an idle cache is left alone, and dry-run never cleans it. The
+currently requested transfer is retained and its chunks are verified for resume.
+
+Activity is recorded atomically in file contents on open, successful chunk receipt,
+clear and normal close. It does not depend on filesystem timestamps, including on
+VFAT. Missing or malformed records get a full retention period on discovery;
+future timestamps are retained until the clock catches up. A forward clock jump
+can expire inactive cache early, requiring those bytes to be transferred again.
+Active stores are protected by cache and transfer locks. Unexpected objects stop
+cleanup of the affected transfer.
+
+Stop all cache users before upgrading from versions without this locking scheme.
+For manual cleanup, stop every rrsync process using that cache, remove its contents,
+then restart. Never remove lock files while a cache user is running. Use a private
+cache location (appropriate mount permissions on VFAT).
 
 ## Synchronization
 

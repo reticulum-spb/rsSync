@@ -116,6 +116,12 @@ impl Root {
     }
     /// Lock private resume state. Keep the lock inode in place across owners.
     pub(crate) fn lock_state(&self, path: &str) -> Result<File> {
+        self.lock_state_with(path, false)
+    }
+    pub(crate) fn lock_state_shared(&self, path: &str) -> Result<File> {
+        self.lock_state_with(path, true)
+    }
+    fn lock_state_with(&self, path: &str, shared: bool) -> Result<File> {
         let f: File = rx::openat2(
             &*self.fd,
             self.full(path)?.as_str(),
@@ -127,7 +133,14 @@ impl Root {
         if !f.metadata()?.is_file() || f.metadata()?.nlink() != 1 {
             return Err(Error::InvalidPath("invalid resume lock".into()));
         }
-        rx::flock(&f, rx::FlockOperation::NonBlockingLockExclusive)?;
+        rx::flock(
+            &f,
+            if shared {
+                rx::FlockOperation::NonBlockingLockShared
+            } else {
+                rx::FlockOperation::NonBlockingLockExclusive
+            },
+        )?;
         Ok(f)
     }
     pub fn metadata(&self, path: &str) -> Result<Metadata> {

@@ -122,6 +122,7 @@ fn cache(config: &Config, root: &Root) -> Result<Option<v2::Cache>> {
         limits: Some(crate::chunks::Limits {
             max_bytes: resume.max_bytes,
             max_transfers: resume.max_transfers,
+            retention_seconds: resume.retention_seconds,
         }),
     }))
 }
@@ -561,6 +562,7 @@ mod tests {
                 directory: directory.into(),
                 max_bytes: 1_000_000,
                 max_transfers: 10,
+                retention_seconds: 604800,
             }),
             ..Config::default()
         }
