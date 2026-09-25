@@ -185,13 +185,11 @@ impl Store {
     pub fn receive(&self, index: usize, reader: &mut impl Read) -> Result<()> {
         let name = self.name(index)?;
         self.root
-            .stage(
+            .stage_content(
                 &name,
                 reader,
                 self.description.length(index)?,
-                Some(self.description.hashes[index]),
-                0,
-                0,
+                self.description.hashes[index],
             )?
             .commit()
     }

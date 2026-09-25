@@ -211,6 +211,26 @@ impl Root {
         sec: i64,
         ns: u32,
     ) -> Result<Staged> {
+        self.stage_inner(path, reader, size, hash, Some((sec, ns)))
+    }
+    /// Stage verified payloads without requiring filesystem timestamp semantics.
+    pub(crate) fn stage_content(
+        &self,
+        path: &str,
+        reader: &mut impl Read,
+        size: u64,
+        hash: [u8; 32],
+    ) -> Result<Staged> {
+        self.stage_inner(path, reader, size, Some(hash), None)
+    }
+    fn stage_inner(
+        &self,
+        path: &str,
+        reader: &mut impl Read,
+        size: u64,
+        hash: Option<[u8; 32]>,
+        mtime: Option<(i64, u32)>,
+    ) -> Result<Staged> {
         let (dir, name) = self.parent(path)?;
         // tempfile creates securely with O_EXCL and a randomized name in the same directory.
         let temp = tempfile::Builder::new()
@@ -254,7 +274,9 @@ impl Root {
         {
             return Err(Error::HashMismatch(path.into()));
         }
-        set_mtime(staged.temp.as_file(), sec, ns)?;
+        if let Some((sec, ns)) = mtime {
+            set_mtime(staged.temp.as_file(), sec, ns)?;
+        }
         staged.temp.as_file().sync_all()?;
         Ok(staged)
     }

@@ -166,3 +166,12 @@ with at most 128 components, each no longer than 255 bytes. Linux 5.6 or newer
 and a mounted `/proc` are required. Failed runs
 exit with a nonzero status. Abrupt process termination can leave reserved temporary
 files; remove them manually when no synchronization is running.
+
+On Linux VFAT (FAT with long filenames), file replacement uses the same
+same-directory staging and rename operations. The filesystem must support file
+and directory `fsync` and advisory locks; errors are reported rather than ignored.
+FAT rounds modification times to two-second precision, so exact source mtimes
+cannot be preserved and unchanged files can be transferred again, including with
+`--checksum` under the current comparison rules. Use names representable on the
+destination filesystem and avoid names differing only in case. Atomic replacement
+during normal operation does not guarantee recovery from power loss on FAT.

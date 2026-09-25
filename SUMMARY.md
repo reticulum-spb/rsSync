@@ -216,6 +216,13 @@ are not restored. The client must establish a fresh authenticated Link and start
 with START; unfinished files are transferred in full. Keep the same export root
 to let the new manifest reflect previously committed files.
 
+Wire mtimes retain seconds/nanoseconds even when the destination filesystem rounds
+them. Report the actual stored metadata in the next manifest; do not pretend that
+the requested precision was preserved. In v1, matching checksums do not override
+an mtime mismatch, so a coarse-timestamp filesystem such as FAT may require the
+same file again. No timestamp tolerance or filesystem capability negotiation is
+defined by v1. Filesystem errors must not produce a successful commit response.
+
 Protocol errors abort only the offending connection's session. Out-of-order or
 repeated mutation commands are rejected; a busy request from a different Link
 must not release the active export session. Discard file completions from another
