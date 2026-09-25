@@ -65,6 +65,9 @@ pub struct Server {
     session: Option<Session>,
 }
 impl Server {
+    pub fn active(&self) -> bool {
+        self.session.is_some()
+    }
     pub fn new(root: Root) -> Self {
         Self {
             root,

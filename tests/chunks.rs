@@ -257,3 +257,39 @@ fn larger_chunks_stream_and_reject_reader_failure() {
     assert!(store.missing().unwrap().is_empty());
     assert_eq!(assembled(&store), data);
 }
+
+#[test]
+fn cache_quota_reserves_missing_bytes_and_excludes_concurrent_owners() {
+    use rrsync::chunks::Limits;
+    let tmp = tempfile::tempdir().unwrap();
+    let data = bytes();
+    let d = description(&data, 4096);
+    let limits = Limits {
+        max_bytes: data.len() as u64,
+        max_transfers: 4,
+    };
+    let store = Store::open_limited(tmp.path(), context(), d.clone(), limits).unwrap();
+    assert!(Store::open_limited(tmp.path(), [9; 32], d.clone(), limits).is_err());
+    store.receive(0, &mut Cursor::new(&data[..4096])).unwrap();
+    drop(store);
+    let store = Store::open_limited(tmp.path(), context(), d.clone(), limits).unwrap();
+    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    drop(store);
+    assert!(Store::open_limited(tmp.path(), [9; 32], d.clone(), limits).is_err());
+    assert!(
+        Store::open_limited(
+            tmp.path(),
+            [8; 32],
+            d.clone(),
+            Limits {
+                max_bytes: 100000,
+                max_transfers: 1
+            }
+        )
+        .is_err()
+    );
+    let store = Store::open_limited(tmp.path(), context(), d, limits).unwrap();
+    fill(&store, &data);
+    assert_eq!(assembled(&store), data);
+    store.clear().unwrap();
+}

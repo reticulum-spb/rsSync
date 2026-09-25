@@ -76,6 +76,55 @@ cp rrsync.example.yaml ./client-config/config.yaml
 rrsync --config ./client-config identity
 ```
 
+## Resumable transfers
+
+Version 1 remains the default. To send files in resumable chunks, configure both
+peers with `resume` and select `protocol: 2` on the client:
+
+```yaml
+protocol: 2
+resume:
+  chunk_size: 1048576
+  directory: transfers
+  max_bytes: 536870912
+  max_transfers: 128
+```
+
+The client selects `chunk_size` for both directions. It is required and has no
+default; the example uses 1 MiB. Allowed sizes
+are 4 KiB–16 MiB, with at most 8,192 chunks per file. Choose a size appropriate for
+your link; no universally optimal size is assumed. `directory` defaults to
+`transfers`, relative to the application configuration directory; an absolute path
+is also accepted. It must be outside the synchronized tree and cannot contain it.
+The directory is created on the first real receive, never by dry-run.
+
+A server with a `resume` section accepts both versions. The `protocol` setting
+selects the version for outgoing push/pull and defaults to 1. Version 2 requires
+`resume`; unsupported peers produce an error, with no automatic fallback. Both
+versions share the server's single-session limit.
+
+After an interruption, rerun the same command. The receiver verifies cached blocks
+and requests only missing or damaged ones. Changed source content, chunk size,
+peer identity or path starts separate state. Every received block and the assembled
+file are checked with SHA-256, including when `--checksum` is absent. The flag
+still controls the initial comparison of existing files. Logs report cached and
+missing chunk counts per file. Automatic reconnect and delta transfer are not
+implemented.
+
+`max_bytes` defaults to 512 MiB and limits logical cached payload/staging bytes,
+reserving room for the missing blocks of each incoming file. It excludes filesystem
+allocation overhead, native Resource temporary files and assembled snapshots.
+`max_transfers` defaults to 128 and limits retained transfer directories, including
+empty lock directories after successful transfers. Both limits must be positive;
+`max_transfers` must be below 16,384. Exceeding a limit fails without evicting other
+transfers. One receiving transfer owns a cache directory at a time.
+
+Successful installation removes cached blocks. Interrupted state is retained;
+there is no automatic expiry yet. To reclaim stale state and empty lock directories,
+stop every rrsync process using that cache, remove its contents, then restart.
+Never remove lock files while a cache user is running. Use a private cache
+location (appropriate mount permissions on VFAT).
+
 ## Synchronization
 
 On the client, run `rrsync identity`. On the server, run the same command to initialize
@@ -142,13 +191,13 @@ permissions, ownership, ACLs and xattrs are not copied.
 Received files are verified in temporary storage before installation. Replacing a
 regular file is atomic. An interrupted transfer leaves the previous file intact.
 A failed run may have installed earlier files; rerunning skips completed unchanged
-files and retransmits the unfinished file. After an abrupt client exit, wait for
+files. Version 1 retransmits the unfinished file; version 2 reuses its verified
+cached blocks. After an abrupt client exit, wait for
 the server inactivity timeout before retrying. If a commit or final response is
 lost, the receiving side may already have completed that operation. Rerun the
 synchronization to compare actual directory contents; commands are not automatically
 replayed after an uncertain result. Source changes detected during a run
-cause failure. Chunk resume, delta transfer and automatic session reconnection are
-not implemented.
+cause failure. Delta transfer and automatic session reconnection are not implemented.
 
 After a server process exits, restart `serve` with the same configuration directory
 and export directory, then rerun the client command. The saved identity preserves

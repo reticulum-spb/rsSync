@@ -4,6 +4,8 @@ Usage: python3 tests/reticulum_e2e.py [rrsync-binary] [reticulum-config-director
 """
 import argparse
 import os
+import re
+import shutil
 import stat
 import pathlib
 import subprocess
@@ -16,7 +18,9 @@ parser.add_argument('binary', nargs='?', default='target/debug/rrsync')
 parser.add_argument('reticulum_config', nargs='?', default='~/.rsReticulum')
 parser.add_argument('--lifecycle-only', action='store_true',
                     help='run only interrupted pull and server restart scenarios')
+parser.add_argument('--protocol', type=int, choices=[1, 2], default=1)
 args = parser.parse_args()
+resume_yaml = ('protocol: 2\nresume:\n  chunk_size: 2097152\n' if args.protocol == 2 else '')
 binary = str(pathlib.Path(args.binary).resolve())
 reticulum_config = str(pathlib.Path(args.reticulum_config).expanduser().resolve())
 
@@ -53,23 +57,32 @@ def partial_resource(process, size):
             continue
     return False
 
+def cached_large_chunk(directory):
+    for chunk in directory.glob('*/*.chunk'):
+        try:
+            if chunk.stat().st_size == 2097152:
+                return True
+        except FileNotFoundError:
+            pass
+    return False
+
 with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
     root = pathlib.Path(temp)
     rns = reticulum_config
     server_config = root/'server-config'
     client_config = root/'client-config'
     server_config.mkdir(); client_config.mkdir()
-    (client_config/'config.yaml').write_text(f'reticulum_config: {rns}\ntimeout_seconds: 30\n')
+    (client_config/'config.yaml').write_text(f'reticulum_config: {rns}\ntimeout_seconds: 30\n{resume_yaml}')
     def cli(*args, expect=0):
         run = subprocess.run([binary, '--config', str(client_config), *map(str,args)], capture_output=True, text=True, timeout=150)
         if run.returncode != expect:
             raise AssertionError(f'{args}: exit {run.returncode}\n{run.stdout}\n{run.stderr}')
-        return run.stdout
+        return run.stdout + run.stderr
     client_id = cli('identity').strip().split()[-1]
     read_config = root/'read-config'; read_config.mkdir()
-    (read_config/'config.yaml').write_text(f'reticulum_config: {rns}\ntimeout_seconds: 30\n')
+    (read_config/'config.yaml').write_text(f'reticulum_config: {rns}\ntimeout_seconds: 30\n{resume_yaml}')
     reader_id = subprocess.check_output([binary,'--config',str(read_config),'identity'],text=True).strip().split()[-1]
-    (server_config/'config.yaml').write_text(f'reticulum_config: {rns}\npermits:\n  - others: deny\n  - "{client_id}": full\n  - "{reader_id}": read\ntimeout_seconds: 8\nannounce_seconds: 5\n')
+    (server_config/'config.yaml').write_text(f'reticulum_config: {rns}\npermits:\n  - others: deny\n  - "{client_id}": full\n  - "{reader_id}": read\ntimeout_seconds: 8\nannounce_seconds: 5\n{resume_yaml}')
     export = root/'export'; export.mkdir()
     source = root/'source'; source.mkdir()
     (source/'empty-dir').mkdir(); (source/'nested').mkdir()
@@ -95,6 +108,15 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
         server, dest = start_server()
         remote = dest+':/backup'
         if not args.lifecycle_only:
+            if args.protocol == 2:
+                cli('push', '--dry-run', source, remote)
+                assert not (server_config/'transfers').exists()
+                assert not (client_config/'transfers').exists()
+                legacy = root/'legacy-config'; legacy.mkdir()
+                (legacy/'config.yaml').write_text(f'reticulum_config: {rns}\ntimeout_seconds: 30\n')
+                shutil.copyfile(client_config/'identity', legacy/'identity')
+                subprocess.run([binary, '--config', str(legacy), 'push', '--dry-run', str(source), remote],
+                               check=True, capture_output=True, text=True, timeout=150)
             cli('push','--checksum',source,remote)
             assert contents(source)==contents(export/'backup'), 'initial push mismatch'
             repeat = cli('push','--checksum',source,remote)
@@ -182,7 +204,11 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
                                          '--checksum', '--delete', *operands], stdout=log, stderr=log)
             processes.append(transfer)
             receiver_process = server if push else transfer
-            wait_for(lambda: partial_resource(receiver_process, len(data)), 40)
+            if args.protocol == 2:
+                cache_dir = (server_config if push else client_config)/'transfers'
+                wait_for(lambda: cached_large_chunk(cache_dir), 40)
+            else:
+                wait_for(lambda: partial_resource(receiver_process, len(data)), 40)
             assert (receiver_tree/'a-first').read_bytes() == b'first committed'
             if scenario == 'kill-pull-client':
                 transfer.kill(); transfer.wait(timeout=5)
@@ -199,6 +225,8 @@ with tempfile.TemporaryDirectory(prefix='rrsync-e2e-') as temp:
             recovered = cli(direction, '--checksum', '--delete', *operands)
             assert 'Skip\ta-first' in recovered, recovered
             assert contents(sender_tree) == contents(receiver_tree), scenario+' recovery mismatch'
+            if args.protocol == 2:
+                assert re.search(r'cached_chunks=[1-9]', recovered), recovered
             print('PASS: '+scenario+' during segmented transfer; old file preserved and retry completed', flush=True)
         if not args.lifecycle_only:
             print('PASS: push, pull, checksum, repeated sync, one-file update, delete, dry-run, empty files/directories, Unicode, segmented Resource, interruption/recovery, protected exclusions, read-only permissions, unauthorized identity', flush=True)

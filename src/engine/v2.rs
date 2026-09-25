@@ -19,12 +19,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-/// The adapter must supply a private, existing directory outside synced trees and
-/// a stable canonical identifier for the receiving root. Construction writes nothing.
+/// The adapter supplies a private directory outside synced trees and a stable
+/// canonical root identifier. Limited caches are created lazily on receive;
+/// unrestricted library callers must supply an existing directory.
 #[derive(Clone, Debug)]
 pub struct Cache {
     pub directory: PathBuf,
     pub root_id: String,
+    pub limits: Option<chunks::Limits>,
 }
 impl Cache {
     fn open(
@@ -40,11 +42,17 @@ impl Cache {
         } else {
             format!("{prefix}/{}", entry.path)
         };
-        Store::open(
-            &self.directory,
-            chunks::scope(peer, push, &self.root_id, &path)?,
-            description,
-        )
+        let scope = chunks::scope(peer, push, &self.root_id, &path)?;
+        if let Some(limits) = self.limits {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(&self.directory)?;
+            Store::open_limited(&self.directory, scope, description, limits)
+        } else {
+            Store::open(&self.directory, scope, description)
+        }
     }
 }
 pub enum ServerReply {
@@ -486,6 +494,7 @@ async fn synchronize_inner(
                 return Err(invalid("unexpected file index"));
             }
             validate_missing(&chunks, description.hashes().len())?;
+            tracing::info!(path=%e.path, cached_chunks=description.hashes().len()-chunks.len(), missing_chunks=chunks.len(), "resume plan");
             for chunk in chunks {
                 let part = chunk_file(&mut file, &description, chunk as usize)?;
                 ok(link, Message::ChunkBegin { index, chunk }, deadline).await?;
@@ -528,7 +537,9 @@ async fn synchronize_inner(
             let store = resume
                 .cache
                 .open(resume.peer, false, &path, e, description.clone())?;
-            for chunk in store.missing()? {
+            let missing = store.missing()?;
+            tracing::info!(path=%e.path, cached_chunks=description.hashes().len()-missing.len(), missing_chunks=missing.len(), "resume plan");
+            for chunk in missing {
                 ok(
                     link,
                     Message::ChunkGet {

@@ -52,10 +52,12 @@ impl Fixture {
         fs::write(destination.join("file"), b"old").unwrap();
         fs::write(destination.join("extra"), b"keep until finish").unwrap();
         let server_cache = Cache {
+            limits: None,
             directory: sc,
             root_id: remote.to_str().unwrap().into(),
         };
         let client_cache = Cache {
+            limits: None,
             directory: cc,
             root_id: local.to_str().unwrap().into(),
         };

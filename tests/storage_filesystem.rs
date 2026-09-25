@@ -126,3 +126,36 @@ fn persistent_chunks_on_selected_filesystem() {
     store.clear().unwrap();
     assert_eq!(fs::read_dir(directory(&state)).unwrap().count(), 1);
 }
+
+#[test]
+#[ignore = "requires an explicitly selected mounted filesystem"]
+fn quota_and_cache_lock_on_selected_filesystem() {
+    use rrsync::chunks::Limits;
+    let selected = std::env::var_os("RRSYNC_TEST_FILESYSTEM").expect("set RRSYNC_TEST_FILESYSTEM");
+    let fixture = tempfile::Builder::new()
+        .prefix("rrsync-quota-")
+        .tempdir_in(selected)
+        .unwrap();
+    let bytes = data();
+    let d = description(&bytes);
+    let limits = Limits {
+        max_bytes: bytes.len() as u64,
+        max_transfers: 4,
+    };
+    let store = Store::open_limited(fixture.path(), context(), d.clone(), limits).unwrap();
+    store
+        .receive(0, &mut Cursor::new(&bytes[..262144]))
+        .unwrap();
+    assert!(Store::open_limited(fixture.path(), [1; 32], d.clone(), limits).is_err());
+    drop(store);
+    assert!(Store::open_limited(fixture.path(), [1; 32], d.clone(), limits).is_err());
+    let store = Store::open_limited(fixture.path(), context(), d, limits).unwrap();
+    assert_eq!(store.missing().unwrap(), vec![1, 2]);
+    for (i, part) in bytes.chunks(262144).enumerate().skip(1) {
+        store.receive(i, &mut Cursor::new(part)).unwrap();
+    }
+    let mut actual = Vec::new();
+    store.assemble().unwrap().read_to_end(&mut actual).unwrap();
+    assert_eq!(actual, bytes);
+    store.clear().unwrap();
+}

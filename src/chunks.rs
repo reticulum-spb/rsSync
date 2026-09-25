@@ -1,4 +1,4 @@
-//! Local foundation for future chunk transfer; protocol v1 does not use it yet.
+//! Persistent verified chunk storage for v2; protocol v1 does not use it.
 //! Callers must negotiate a fresh description after authentication on every run.
 use crate::{
     Error, Result,
@@ -137,8 +137,69 @@ pub struct Store {
     root: Root,
     description: Description,
     _lock: File,
+    _cache_lock: Option<File>,
+}
+#[derive(Clone, Copy, Debug)]
+pub struct Limits {
+    pub max_bytes: u64,
+    pub max_transfers: usize,
 }
 impl Store {
+    /// Reserve space for all missing chunks while exclusively owning this cache.
+    /// Quota counts logical payload/staging bytes, not filesystem allocation overhead.
+    pub fn open_limited(
+        directory: &Path,
+        scope: [u8; 32],
+        description: Description,
+        limits: Limits,
+    ) -> Result<Self> {
+        let root = Root::open(directory)?;
+        let lock = root.lock_state("cache.lock")?;
+        let key = description.key(scope);
+        let mut bytes = 0u64;
+        let mut transfers = 0usize;
+        let mut found = false;
+        for (name, metadata) in root.children("")? {
+            if name == "cache.lock" {
+                continue;
+            }
+            if name.len() != 64
+                || !name.bytes().all(|b| b.is_ascii_hexdigit())
+                || !metadata.is_dir()
+            {
+                return Err(Error::Config("unexpected object in chunk cache".into()));
+            }
+            transfers += 1;
+            found |= name == key;
+            for (child, meta) in root.children(&name)? {
+                if !meta.is_file() {
+                    return Err(Error::Config("unsupported object in chunk cache".into()));
+                }
+                if child != "lock" {
+                    bytes = bytes
+                        .checked_add(meta.len())
+                        .ok_or_else(|| Error::Config("cache size overflow".into()))?;
+                }
+            }
+        }
+        if transfers + usize::from(!found) > limits.max_transfers || bytes > limits.max_bytes {
+            return Err(Error::Config(
+                "chunk cache quota exceeded; clean stale state while all users are stopped".into(),
+            ));
+        }
+        let mut store = Self::open(directory, scope, description)?;
+        let needed = store
+            .missing()?
+            .into_iter()
+            .try_fold(0u64, |sum, i| -> Result<u64> {
+                Ok(sum + store.description.length(i)?)
+            })?;
+        if needed > limits.max_bytes - bytes {
+            return Err(Error::Config("chunk cache byte quota exceeded".into()));
+        }
+        store._cache_lock = Some(lock);
+        Ok(store)
+    }
     pub fn open(directory: &Path, scope: [u8; 32], description: Description) -> Result<Self> {
         let parent = Root::open(directory)?;
         let key = description.key(scope);
@@ -149,6 +210,7 @@ impl Store {
             root,
             description,
             _lock: lock,
+            _cache_lock: None,
         })
     }
     fn name(&self, index: usize) -> Result<String> {

@@ -1,4 +1,4 @@
-//! Chunk-transfer codec used by engine::v2; not yet enabled by the Reticulum adapter.
+//! Chunk-transfer codec used by engine::v2 and the opt-in Reticulum v2 adapter.
 //! Version and request path are distinct from v1; legacy file commands are rejected.
 use super::{MAX_CONTROL, Reader, Writer};
 use crate::{

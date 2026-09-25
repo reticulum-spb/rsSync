@@ -6,6 +6,26 @@ use std::{
 };
 
 pub const MINIMAL_CONFIG: &str = "permits:\n  - others: deny\n";
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ResumeConfig {
+    pub chunk_size: u32,
+    #[serde(default = "cache_directory")]
+    pub directory: PathBuf,
+    #[serde(default = "cache_bytes")]
+    pub max_bytes: u64,
+    #[serde(default = "cache_transfers")]
+    pub max_transfers: usize,
+}
+fn cache_directory() -> PathBuf {
+    "transfers".into()
+}
+fn cache_bytes() -> u64 {
+    512 * 1024 * 1024
+}
+fn cache_transfers() -> usize {
+    128
+}
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum Permission {
@@ -24,6 +44,8 @@ pub struct Config {
     pub reticulum_config: Option<String>,
     pub timeout_seconds: u64,
     pub announce_seconds: u64,
+    pub protocol: u8,
+    pub resume: Option<ResumeConfig>,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -33,6 +55,8 @@ impl Default for Config {
             reticulum_config: None,
             timeout_seconds: 600,
             announce_seconds: 600,
+            protocol: 1,
+            resume: None,
         }
     }
 }
@@ -79,6 +103,24 @@ impl Config {
             return Err(Error::Config("timeouts must be positive".into()));
         }
         config.identity = directory.join("identity");
+        if !matches!(config.protocol, 1 | 2) || (config.protocol == 2 && config.resume.is_none()) {
+            return Err(Error::Config(
+                "protocol must be 1 or 2; protocol 2 requires resume configuration".into(),
+            ));
+        }
+        if let Some(resume) = &mut config.resume {
+            crate::chunks::Description::count(0, resume.chunk_size)
+                .map_err(|e| Error::Config(e.to_string()))?;
+            if resume.max_bytes == 0
+                || resume.max_transfers == 0
+                || resume.max_transfers >= crate::sync::MAX_ENTRIES
+            {
+                return Err(Error::Config("invalid resume cache limits".into()));
+            }
+            if resume.directory.is_relative() {
+                resume.directory = directory.join(&resume.directory);
+            }
+        }
         Ok(config)
     }
     pub fn permission(&self, id: &[u8; 16]) -> Permission {
@@ -152,6 +194,32 @@ mod tests {
                 .permission(&[0; 16]),
             Permission::Read
         );
+    }
+    #[test]
+    fn resume_config_validates_explicit_version_geometry_and_limits() {
+        let tmp = tempfile::tempdir().unwrap();
+        for text in [
+            "protocol: 3",
+            "protocol: 2",
+            "resume: {}",
+            "resume: {chunk_size: 1}",
+            "resume: {chunk_size: 4096, max_bytes: 0}",
+            "resume: {chunk_size: 4096, max_transfers: 0}",
+            "resume: {chunk_size: 4096, max_transfers: 16384}",
+        ] {
+            std::fs::write(tmp.path().join("config.yaml"), text).unwrap();
+            assert!(Config::load_directory(tmp.path(), false).is_err(), "{text}");
+        }
+        std::fs::write(
+            tmp.path().join("config.yaml"),
+            "protocol: 2\nresume: {chunk_size: 262144}",
+        )
+        .unwrap();
+        let config = Config::load_directory(tmp.path(), false).unwrap();
+        let resume = config.resume.unwrap();
+        assert_eq!(resume.directory, tmp.path().join("transfers"));
+        assert_eq!(resume.max_bytes, 512 * 1024 * 1024);
+        assert!(!resume.directory.exists());
     }
     #[test]
     fn invalid_permissions_rejected() {

@@ -11,3 +11,13 @@ permits:
   # - "0123456789abcdef0123456789abcdef": full
   # - "fedcba9876543210fedcba9876543210": read
   - others: deny
+
+# Optional chunk resume. Client protocol defaults to 1; configure resume on both
+# peers and select protocol: 2 on the client. Server then accepts both versions.
+# Chunk size has no default: 1 MiB below is an example, not a tuned recommendation.
+# protocol: 2
+# resume:
+#   chunk_size: 1048576
+#   directory: transfers  # relative to this configuration directory; outside export
+#   max_bytes: 536870912
+#   max_transfers: 128

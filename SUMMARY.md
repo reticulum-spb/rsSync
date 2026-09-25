@@ -4,8 +4,8 @@ This document describes the Reticulum interaction and application wire protocol
 for an independent Python implementation. Protocol version 1 is implemented by the
 Rust client and server. Filesystem operations remain the responsibility of each
 implementation; native Reticulum delivers encrypted, verified Resources.
-The final v2 section describes a tested codec and engine that are not yet enabled
-in the Reticulum adapter or CLI.
+Version 2 is opt-in and described in the final section; it adds persistent chunk
+resume over the same native Link/Resource transport.
 
 ## Runtime, identity and destination
 
@@ -283,20 +283,25 @@ These mappings describe the intended Python port; interoperability with a Python
 rrsync implementation has not yet been tested. The currently validated peers are
 Rust client/server processes attached to the existing rnsd-rs shared instance.
 
-## Version 2 chunk extension — engine implemented, not served yet
+## Version 2 chunk extension
 
-The Rust library includes a bounded v2 codec in `src/protocol/v2.rs` and client/server
-state machines in `src/engine/v2.rs`, verified over a simulated file transport.
-The active CLI and Reticulum request handler still use v1 exclusively. Do not send
-these messages to the current server or assume that chunk resume is available.
-This section fixes the encoding and engine behavior for transport integration.
-Capability selection and native Reticulum integration still need implementation.
+The Rust client selects v2 with YAML `protocol: 2`, which requires a `resume`
+section containing an explicit `chunk_size`. A server with `resume` configured
+accepts both `/rrsync/v1` and `/rrsync/v2`, irrespective of its outgoing `protocol`
+setting. With no `resume`, v2 requests are rejected. Version 1 remains the default.
 
-V2 uses a distinct request path `/rrsync/v2` and header `version:u8 = 2, tag:u8`.
-The destination remains `rrsync.sync`. Never send v2 on `/rrsync/v1`, mix versions
-within a Link, or fall back to v1 after an uncertain mutation. An unsupported
-version/path must fail without starting a transfer. Capability discovery or an
-explicit version selection policy is not implemented yet.
+V2 uses request path `/rrsync/v2` and header `version:u8 = 2, tag:u8`.
+The destination remains `rrsync.sync`. Version is pinned on the first authenticated
+request for a Link and cannot change, including after FINISH. A rejected/busy
+request does not release another Link's session. Both engines share one active
+export session; separate v1 and v2 sessions may not mutate the export concurrently.
+The response/error encoding follows the requested path's version. There is no
+capability probing, fallback or automatic reconnect.
+
+The client recalls the announced public key, verifies that its identity derives
+the requested `rrsync.sync` destination, and validates native Link establishment
+with that key. Its cache scope uses the remote identity hash from that verified
+key. The server uses the authenticated client identity supplied by LinkManager.
 
 All integers remain big-endian. START (1), MANIFEST (2), FINISH (7), OK (8) and
 ERROR (9) keep the exact field layouts documented for v1, with version byte 2.
@@ -394,8 +399,8 @@ fresh descriptions. The receiver reports only cached chunks that pass size/hash
 checks. Do not persist/replay pending Resource receipts or session commands.
 Changed identities, paths, source bytes or chunk sizes must not accidentally reuse
 another transfer's state. A lost chunk or file acknowledgement is resolved by
-fresh negotiation, not blind mutation replay. Receiver-state quotas, retention,
-configuration and automatic reconnect are still pending integration.
+fresh negotiation, not blind mutation replay. Receiver-state configuration and quotas are described below. Automatic reconnect
+and timed retention are not implemented.
 
 The engine receives authenticated peer identity and current permission from its
 adapter on every request. An identity change or revoked write permission aborts
@@ -411,6 +416,27 @@ committed chunks. Lost close notifications rely on the inactivity lease; native
 traffic should refresh it as in v1. Successful installation triggers best-effort
 chunk eviction. Eviction failure is logged and does not undo file installation or
 turn its acknowledgement into a failure. Empty cache lock directories remain.
+
+### Receiver cache policy
+
+Rust `resume.directory` defaults to `transfers` relative to the app configuration
+directory. Resolve the root and cache to absolute paths and reject overlap before
+connecting/serving. Create state lazily on a real receive, outside the sync tree.
+Dry-run must not create a cache or acquire persistent cache locks.
+
+The default limits are `max_bytes: 536870912` and `max_transfers: 128`. Under an
+exclusive cache-wide lock, count existing payload/staging bytes and reserve the
+space needed for missing chunks before accepting new data. Reject quota violations
+without deleting another transfer's data. An additional per-transfer lock protects
+the individual description. Hold both until file completion or session teardown;
+process termination releases them. The byte limit excludes native Resource and
+assembly/snapshot temporary storage and filesystem allocation overhead.
+
+Directory-count limits include retained empty lock directories. Successful file
+installation evicts its chunks; stale state and lock directories currently require
+manual cleanup with all cache users stopped. No filesystem timestamps are used to
+validate chunks or determine expiry. All adapter cache users must obey the same
+cache-wide lock; do not mix unrestricted storage-library access with live sessions.
 
 ### Fixed v2 encoding examples
 

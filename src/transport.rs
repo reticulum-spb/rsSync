@@ -1,7 +1,7 @@
 use crate::{
     Error, Result,
     config::{Config, Permission},
-    engine::{self, SyncTransport},
+    engine::{self, SyncTransport, v2},
     fs::Root,
     protocol::{MAX_CONTROL, Message, REQUEST_PATH},
     sync::{self, MAX_FILE, Options},
@@ -80,47 +80,142 @@ pub async fn runtime(
 
 struct Service {
     engine: engine::Server,
+    v2: Option<v2::Server>,
+    versions: HashMap<[u8; 16], u8>,
     incoming: mpsc::Receiver<FileResourceCompletion>,
     identities: Arc<Mutex<HashMap<[u8; 16], [u8; 16]>>>,
     config: Config,
 }
+fn is_v2(path: [u8; 16]) -> bool {
+    path == rns_crypto::sha::truncated_hash(crate::protocol::v2::REQUEST_PATH.as_bytes())
+}
+fn cache(config: &Config, root: &Root) -> Result<Option<v2::Cache>> {
+    let Some(resume) = &config.resume else {
+        return Ok(None);
+    };
+    let root_path = root.resolved_path()?;
+    let directory = Root::destination(&resume.directory)?.resolved_path()?;
+    if directory.starts_with(&root_path) || root_path.starts_with(&directory) {
+        return Err(Error::Config(
+            "resume directory must be outside the synchronized tree".into(),
+        ));
+    }
+    Ok(Some(v2::Cache {
+        directory,
+        root_id: root_path
+            .to_str()
+            .ok_or_else(|| Error::Config("non-UTF-8 root".into()))?
+            .into(),
+        limits: Some(crate::chunks::Limits {
+            max_bytes: resume.max_bytes,
+            max_transfers: resume.max_transfers,
+        }),
+    }))
+}
 impl Service {
+    fn disconnect(&mut self, link: [u8; 16]) {
+        self.engine.disconnect(link);
+        if let Some(engine) = &mut self.v2 {
+            engine.disconnect(link);
+        }
+    }
+    fn touch(&mut self, link: [u8; 16], now: Instant) {
+        self.engine.touch(link, now);
+        if let Some(engine) = &mut self.v2 {
+            engine.touch(link, now);
+        }
+    }
+    fn expire(&mut self, now: Instant, timeout: Duration) -> Option<[u8; 16]> {
+        let v1 = self.engine.expire(now, timeout);
+        let v2 = self.v2.as_mut().and_then(|e| e.expire(now, timeout));
+        v1.or(v2)
+    }
+    fn accepts_file(&self, link: [u8; 16], size: u64, metadata: bool) -> bool {
+        self.engine.accepts_file(link, size, metadata)
+            || self
+                .v2
+                .as_ref()
+                .is_some_and(|e| e.accepts_file(link, size, metadata))
+    }
     fn receive(&mut self) {
         while let Ok(file) = self.incoming.try_recv() {
-            self.engine.receive(
-                file.link_id,
-                engine::ReceivedFile {
-                    transfer_id: file.resource_hash,
-                    file: file.file,
-                    size: file.data_size as u64,
-                    has_metadata: file.metadata.is_some(),
-                },
-            );
+            let link = file.link_id;
+            let received = engine::ReceivedFile {
+                transfer_id: file.resource_hash,
+                file: file.file,
+                size: file.data_size as u64,
+                has_metadata: file.metadata.is_some(),
+            };
+            if self.versions.get(&link) == Some(&2) {
+                if let Some(engine) = &mut self.v2 {
+                    engine.receive(link, received);
+                }
+            } else {
+                self.engine.receive(link, received);
+            }
         }
     }
     fn request(&mut self, link: [u8; 16], path: [u8; 16], data: Vec<u8>) -> Result<RequestOutcome> {
-        if path != rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes()) {
+        let v2 = is_v2(path);
+        if !v2 && path != rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes()) {
             return Err(Error::Protocol("unknown request path".into()));
         }
-        let permission = self
+        let peer = self
             .identities
             .lock()
             .unwrap()
             .get(&link)
-            .map(|id| self.config.permission(id))
-            .unwrap_or(Permission::Deny);
+            .copied()
+            .ok_or(Error::PermissionDenied)?;
+        let permission = self.config.permission(&peer);
+        if permission == Permission::Deny {
+            return Err(Error::PermissionDenied);
+        }
+        let version = if v2 { 2 } else { 1 };
+        if self.versions.get(&link).is_some_and(|&v| v != version) {
+            return Err(Error::Protocol("cannot change protocol on a Link".into()));
+        }
+        self.versions.insert(link, version);
         self.receive();
-        match self
-            .engine
-            .handle(link, permission, Message::decode(&data)?)?
-        {
-            engine::ServerReply::Message(message) => Ok(RequestOutcome::Reply(message.encode()?)),
-            engine::ServerReply::File { message, file } => Ok(RequestOutcome::ReplyWithFile {
-                ack: message.encode()?,
-                file: Arc::new(file),
-                metadata: None,
-                auto_compress: false,
-            }),
+        if v2 {
+            if self.engine.active() {
+                return Err(Error::Protocol("server export is busy".into()));
+            }
+            let engine = self.v2.as_mut().ok_or_else(|| {
+                Error::Config("v2 is disabled; configure resume on the server".into())
+            })?;
+            match engine.handle(
+                link,
+                peer,
+                permission,
+                crate::protocol::v2::Message::decode(&data)?,
+            )? {
+                v2::ServerReply::Message(message) => Ok(RequestOutcome::Reply(message.encode()?)),
+                v2::ServerReply::File { message, file } => Ok(RequestOutcome::ReplyWithFile {
+                    ack: message.encode()?,
+                    file: Arc::new(file),
+                    metadata: None,
+                    auto_compress: false,
+                }),
+            }
+        } else {
+            if self.v2.as_ref().is_some_and(|e| e.active()) {
+                return Err(Error::Protocol("server export is busy".into()));
+            }
+            match self
+                .engine
+                .handle(link, permission, Message::decode(&data)?)?
+            {
+                engine::ServerReply::Message(message) => {
+                    Ok(RequestOutcome::Reply(message.encode()?))
+                }
+                engine::ServerReply::File { message, file } => Ok(RequestOutcome::ReplyWithFile {
+                    ack: message.encode()?,
+                    file: Arc::new(file),
+                    metadata: None,
+                    auto_compress: false,
+                }),
+            }
         }
     }
 }
@@ -137,6 +232,7 @@ pub async fn serve_on(
     config: Config,
     root: Root,
 ) -> Result<()> {
+    let v2 = cache(&config, &root)?.map(|cache| v2::Server::new(root.clone(), cache));
     let dest = rns_identity::destination::Destination::hash_from_name_and_identity(
         APP_NAME,
         Some(&id.hash),
@@ -158,6 +254,8 @@ pub async fn serve_on(
     manager.set_link_identity_gate(move |_, id| gate.permits(&id));
     let service = Arc::new(Mutex::new(Service {
         engine: engine::Server::new(root),
+        v2,
+        versions: HashMap::new(),
         incoming: file_rx,
         identities,
         config: config.clone(),
@@ -169,8 +267,14 @@ pub async fn serve_on(
             Ok(reply) => reply,
             Err(e) => {
                 tracing::warn!(error=%e,"sync request failed");
-                state.engine.disconnect(link);
-                RequestOutcome::Reply(Message::error(&e).encode().expect("bounded error"))
+                state.disconnect(link);
+                let error = Message::error(&e);
+                let bytes = if is_v2(path) {
+                    crate::protocol::v2::Message::Common(error).encode()
+                } else {
+                    error.encode()
+                };
+                RequestOutcome::Reply(bytes.expect("bounded error"))
             }
         }
     });
@@ -197,14 +301,14 @@ pub async fn serve_on(
                 manager.tick();
                 let expired={
                     let mut state=service.lock().unwrap(); state.receive();
-                    state.engine.expire(Instant::now(), Duration::from_secs(config.timeout_seconds))
+                    state.expire(Instant::now(), Duration::from_secs(config.timeout_seconds))
                 };
                 if let Some(link_id)=expired {
                     event_tx.send(rns_transport::link_messages::DestinationEvent::LinkClosed {link_id}).await.map_err(transport)?;
                     manager.try_step();
                 }
             },
-            Some(link)=closed_rx.recv()=>{ let mut s=service.lock().unwrap(); s.engine.disconnect(link); },
+            Some(link)=closed_rx.recv()=>{ let mut s=service.lock().unwrap(); s.disconnect(link); s.versions.remove(&link); },
         }
     }
     Ok(())
@@ -248,7 +352,7 @@ fn admit(
     if !authorized {
         return false;
     }
-    state.engine.touch(header.destination_hash, Instant::now());
+    state.touch(header.destination_hash, Instant::now());
     if header.context == C::ResourceAdv {
         let Some(link) = manager.get_link(&header.destination_hash) else {
             return false;
@@ -265,7 +369,7 @@ fn admit(
         if adv.flags.is_response {
             return false;
         }
-        return state.engine.accepts_file(
+        return state.accepts_file(
             header.destination_hash,
             adv.data_size as u64,
             adv.flags.has_metadata,
@@ -287,6 +391,11 @@ pub async fn client(
     } else {
         Root::destination(local)?
     };
+    let resume_cache = if config.protocol == 2 {
+        cache(config, &local_root)?
+    } else {
+        None
+    };
     let scan = sync::scan(&local_root, options.checksum)?;
     let id = identity(config, options.dry_run)?;
     let (runtime, shutdown) = runtime(config, options.dry_run).await?;
@@ -296,39 +405,90 @@ pub async fn client(
             .await_path(remote, deadline)
             .await
             .map_err(transport)?;
-        let mut link = LinkSession::open(&runtime, id, remote, 1, deadline)
-            .await
-            .map_err(transport)?;
+        let (mut link, peer) = if config.protocol == 2 {
+            use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+            let key = match runtime
+                .query_control(TransportQuery::Recall {
+                    destination_hash: remote,
+                })
+                .await
+            {
+                Some(TransportQueryResponse::Announce(Some(entry))) => entry.public_key,
+                _ => None,
+            }
+            .ok_or_else(|| Error::Transport("remote identity not discovered".into()))?;
+            let peer = rns_crypto::sha::truncated_hash(&key);
+            if rns_identity::destination::Destination::hash_from_name_and_identity(
+                APP_NAME,
+                Some(&peer),
+            ) != remote
+            {
+                return Err(Error::Transport(
+                    "remote destination identity mismatch".into(),
+                ));
+            }
+            (
+                LinkSession::open_with_public_key(&runtime, id, remote, key, 1, deadline)
+                    .await
+                    .map_err(transport)?,
+                peer,
+            )
+        } else {
+            (
+                LinkSession::open(&runtime, id, remote, 1, deadline)
+                    .await
+                    .map_err(transport)?,
+                [0; 16],
+            )
+        };
         link.identify().await.map_err(transport)?;
-        engine::synchronize(
-            &mut ReticulumTransport(&mut link),
-            &local_root,
-            scan,
-            engine::SyncRequest {
-                push,
-                path,
-                options,
-                deadline,
-            },
-            |plan| {
-                for op in &plan.operations {
-                    println!("{:?}\t{}", op.action, op.path);
-                }
-            },
-        )
-        .await
+        let job = engine::SyncRequest {
+            push,
+            path,
+            options,
+            deadline,
+        };
+        let on_plan = |plan: &sync::Plan| {
+            for op in &plan.operations {
+                println!("{:?}\t{}", op.action, op.path);
+            }
+        };
+        if let Some(cache) = resume_cache {
+            v2::synchronize(
+                &mut ReticulumTransport(&mut link, crate::protocol::v2::REQUEST_PATH),
+                &local_root,
+                scan,
+                job,
+                v2::Resume {
+                    cache,
+                    peer,
+                    chunk_size: config.resume.as_ref().unwrap().chunk_size,
+                },
+                on_plan,
+            )
+            .await
+        } else {
+            engine::synchronize(
+                &mut ReticulumTransport(&mut link, REQUEST_PATH),
+                &local_root,
+                scan,
+                job,
+                on_plan,
+            )
+            .await
+        }
     }
     .await;
     shutdown.trigger();
     result
 }
 
-struct ReticulumTransport<'a>(&'a mut LinkSession);
+struct ReticulumTransport<'a>(&'a mut LinkSession, &'static str);
 impl SyncTransport for ReticulumTransport<'_> {
     async fn request(&mut self, payload: Vec<u8>, deadline: Duration) -> Result<Vec<u8>> {
         let response = self
             .0
-            .request_with_metadata_limit(REQUEST_PATH, Some(&payload), deadline, MAX_CONTROL + 1024)
+            .request_with_metadata_limit(self.1, Some(&payload), deadline, MAX_CONTROL + 1024)
             .await
             .map_err(transport)?;
         Ok(response.data)
@@ -364,5 +524,104 @@ impl SyncTransport for ReticulumTransport<'_> {
     }
     async fn close(&mut self) -> Result<()> {
         self.0.close().await.map_err(transport)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{config::ResumeConfig, protocol::v2::Message as V2};
+    fn config(directory: &Path) -> Config {
+        Config {
+            permits: vec![std::collections::BTreeMap::from([(
+                "others".into(),
+                Permission::Full,
+            )])],
+            resume: Some(ResumeConfig {
+                chunk_size: 4096,
+                directory: directory.into(),
+                max_bytes: 1_000_000,
+                max_transfers: 10,
+            }),
+            ..Config::default()
+        }
+    }
+    fn start() -> Message {
+        Message::Start {
+            push: true,
+            options: Options::default(),
+            path: String::new(),
+            manifest: sync::Manifest::default(),
+        }
+    }
+    #[test]
+    fn versions_share_export_ownership_and_cannot_mix_on_a_link() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().join("export");
+        std::fs::create_dir(&export).unwrap();
+        let root = Root::open(&export).unwrap();
+        let config = config(&tmp.path().join("cache"));
+        let (_, rx) = mpsc::channel(2);
+        let mut service = Service {
+            engine: engine::Server::new(root.clone()),
+            v2: Some(v2::Server::new(
+                root.clone(),
+                cache(&config, &root).unwrap().unwrap(),
+            )),
+            versions: HashMap::new(),
+            incoming: rx,
+            identities: Arc::new(Mutex::new(HashMap::from([
+                ([1; 16], [7; 16]),
+                ([2; 16], [8; 16]),
+            ]))),
+            config,
+        };
+        let p1 = rns_crypto::sha::truncated_hash(REQUEST_PATH.as_bytes());
+        let p2 = rns_crypto::sha::truncated_hash(crate::protocol::v2::REQUEST_PATH.as_bytes());
+        service
+            .request([1; 16], p1, start().encode().unwrap())
+            .unwrap();
+        assert!(
+            service
+                .request([2; 16], p2, V2::Common(start()).encode().unwrap())
+                .is_err()
+        );
+        assert!(service.engine.active());
+        service
+            .request([1; 16], p1, Message::Finish.encode().unwrap())
+            .unwrap();
+        assert!(
+            service
+                .request([1; 16], p2, V2::Common(start()).encode().unwrap())
+                .is_err()
+        );
+        service
+            .request([2; 16], p2, V2::Common(start()).encode().unwrap())
+            .unwrap();
+        assert!(
+            service
+                .request([1; 16], p1, start().encode().unwrap())
+                .is_err()
+        );
+        assert!(service.v2.as_ref().unwrap().active());
+        service
+            .request([2; 16], p2, V2::Common(Message::Finish).encode().unwrap())
+            .unwrap();
+        assert!(!tmp.path().join("cache").exists()); // planning does not create state
+    }
+    #[test]
+    fn cache_location_is_canonical_and_outside_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let export = tmp.path().join("export");
+        std::fs::create_dir(&export).unwrap();
+        let root = Root::open(&export).unwrap();
+        assert!(cache(&config(&export.join("state")), &root).is_err());
+        assert!(cache(&config(tmp.path()), &root).is_err());
+        let state = tmp.path().join("state");
+        let c = cache(&config(&state), &root).unwrap().unwrap();
+        assert_eq!(c.directory, state);
+        assert!(!state.exists());
+        let missing = Root::destination(&export.join("missing")).unwrap();
+        assert!(cache(&config(&export.join("missing/state")), &missing).is_err());
     }
 }

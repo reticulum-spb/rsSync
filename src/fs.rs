@@ -32,6 +32,13 @@ pub struct Root {
     prefix: String,
 }
 impl Root {
+    /// Stable absolute root name, including a not-yet-created destination suffix.
+    pub fn resolved_path(&self) -> Result<std::path::PathBuf> {
+        Ok(
+            std::fs::read_link(format!("/proc/self/fd/{}", self.fd.as_raw_fd()))?
+                .join(&self.prefix),
+        )
+    }
     pub fn open(path: &Path) -> Result<Self> {
         let fd = std::fs::OpenOptions::new()
             .read(true)
