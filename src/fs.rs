@@ -107,6 +107,22 @@ impl Root {
         }
         Ok(f)
     }
+    /// Lock private resume state. Keep the lock inode in place across owners.
+    pub(crate) fn lock_state(&self, path: &str) -> Result<File> {
+        let f: File = rx::openat2(
+            &*self.fd,
+            self.full(path)?.as_str(),
+            OFlags::RDWR | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::from_bits_truncate(0o600),
+            ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
+        )?
+        .into();
+        if !f.metadata()?.is_file() || f.metadata()?.nlink() != 1 {
+            return Err(Error::InvalidPath("invalid resume lock".into()));
+        }
+        rx::flock(&f, rx::FlockOperation::NonBlockingLockExclusive)?;
+        Ok(f)
+    }
     pub fn metadata(&self, path: &str) -> Result<Metadata> {
         self.open_full(&self.full(path)?, OFlags::PATH)
             .and_then(|f| Ok(f.metadata()?))
@@ -147,7 +163,7 @@ impl Root {
         for name in full.split('/').filter(|s| !s.is_empty()) {
             let dir = self.open_full(&parent, OFlags::RDONLY | OFlags::DIRECTORY)?;
             match rx::mkdirat(&dir, name, Mode::from_bits_truncate(0o755)) {
-                Ok(()) => {}
+                Ok(()) => dir.sync_all()?,
                 Err(rustix::io::Errno::EXIST) => {}
                 Err(e) => return Err(e.into()),
             }

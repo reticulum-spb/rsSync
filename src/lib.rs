@@ -1,4 +1,5 @@
 #![cfg(target_os = "linux")]
+pub mod chunks;
 pub mod config;
 pub mod engine;
 pub mod fs;
