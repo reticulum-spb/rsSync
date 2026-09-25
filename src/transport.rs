@@ -499,6 +499,23 @@ pub async fn client(
         }
     })
     .await;
+    if tracing::enabled!(tracing::Level::DEBUG) {
+        // Query this client's actor, never the daemon-wide query_control counters.
+        use rns_transport::messages::{TransportQuery, TransportQueryResponse};
+        if let Some(TransportQueryResponse::InterfaceStats(entries)) = runtime
+            .query_transport(TransportQuery::GetInterfaceStats)
+            .await
+        {
+            for entry in entries {
+                tracing::debug!(
+                    interface = %entry.name,
+                    rx_bytes = entry.rx_bytes,
+                    tx_bytes = entry.tx_bytes,
+                    "client local interface counters before shutdown"
+                );
+            }
+        }
+    }
     shutdown.trigger();
     result
 }

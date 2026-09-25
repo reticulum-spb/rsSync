@@ -226,7 +226,10 @@ Both push and pull print the plan before transferring data, using `Skip`, `Mkdir
   files have transferred successfully. Without it, extra entries are retained and
   conflicts between files and directories are errors.
 - `--checksum` checks SHA-256 content hashes in addition to path, size and mtime.
-- `-v` / `--verbose` enables diagnostic logging.
+- `-v` / `--verbose` enables diagnostic logging, including available client-local
+  interface RX/TX byte counters before runtime shutdown. These include local
+  shared-instance framing and may include incoming announces unrelated to the
+  sync; they do not measure radio airtime or daemon-wide traffic.
 
 Regular files and directories, including empty files, empty directories and
 Unicode names, are supported. Modification times of synchronized files and

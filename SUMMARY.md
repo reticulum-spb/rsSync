@@ -17,6 +17,14 @@ The shared endpoint is taken from the Reticulum `config.yaml` (Unix abstract soc
 or loopback TCP). Normal client startup may initialize local configuration/storage;
 dry-run requires those paths to exist already.
 
+Rust client debug diagnostics may report local interface RX/TX counters after
+synchronization, before runtime shutdown. These are local actor interface queries,
+not daemon-wide control RPC queries. Counters cover the runtime's lifetime up to
+the sample, include shared-instance framing and possibly unrelated incoming
+announces, and exclude traffic after sampling. They are neither per-Link payload
+counts nor radio airtime measurements. This diagnostic is not a wire message and
+does not require a corresponding Python protocol feature.
+
 The application configuration directory is selected with `--config DIRECTORY`,
 defaulting to `~/.rsSync`. It contains `config.yaml` and the fixed private-key file
 `identity`. Normal first startup bootstraps the default directory with
