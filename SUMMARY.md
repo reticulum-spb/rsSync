@@ -1,62 +1,36 @@
 # rrsync Reticulum interoperability specification
 
-This document describes the Reticulum interaction and application wire protocol
-for an independent Python implementation. Protocol version 1 is implemented by the
-Rust client and server. Filesystem operations remain the responsibility of each
-implementation; native Reticulum delivers encrypted, verified Resources.
-Version 2 is opt-in and described in the final section; it adds persistent chunk
-resume over the same native Link/Resource transport.
+This document specifies the Reticulum carriers, binary messages and session
+semantics required for interoperable rrsync implementations. Version 1 transfers
+whole files; version 2 adds persistent chunk resume over the same native
+Link/Resource transport. Local configuration, storage layouts, diagnostics,
+benchmarks and development status are outside this specification.
 
-## Runtime, identity and destination
+## Reticulum identity and destination
 
-Both application roles attach as clients to an **existing shared rnsd-rs**. They do
-not start a daemon or configure radio/network interfaces. The Rust dependency is
-`rns-runtime` with `default-features = false, features = ["client"]`, from the local
-`../rsReticulum` checkout. `reticulum-client` names this operating mode, not a crate.
-The shared endpoint is taken from the Reticulum `config.yaml` (Unix abstract socket
-or loopback TCP). Normal client startup may initialize local configuration/storage;
-dry-run requires those paths to exist already.
+Both application roles attach to an existing shared Reticulum instance. The
+application destination and wire protocol do not depend on the local daemon
+endpoint or configuration directory.
 
-Rust client debug diagnostics may report local interface RX/TX counters after
-synchronization, before runtime shutdown. These are local actor interface queries,
-not daemon-wide control RPC queries. Counters cover the runtime's lifetime up to
-the sample, include shared-instance framing and possibly unrelated incoming
-announces, and exclude traffic after sampling. They are neither per-Link payload
-counts nor radio airtime measurements. This diagnostic is not a wire message and
-does not require a corresponding Python protocol feature.
-The same diagnostic mode reports the client's Linux `VmHWM` before shutdown;
-this is process resident memory, excluding the shared daemon and kernel page cache.
-
-The application configuration directory is selected with `--config DIRECTORY`,
-defaulting to `~/.rsSync`. It contains `config.yaml` and the fixed private-key file
-`identity`. Normal first startup bootstraps the default directory with
-`permits: [{others: deny}]` and a new identity; dry-run requires existing files.
-Explicit configuration directories require an existing `config.yaml`.
-
-Each application keeps a persistent Reticulum Identity. Identity files are raw
-64-byte private keys, compatible with Python RNS.Identity. Never transmit these
-private keys. The server destination is inbound SINGLE with full name `rrsync.sync`.
+Each application uses a persistent Reticulum Identity; private keys are never
+transmitted. The server destination is inbound SINGLE with full name `rrsync.sync`.
 In Python terms: `RNS.Destination(identity, RNS.Destination.IN,
 RNS.Destination.SINGLE, "rrsync", "sync")`. Announce on startup and periodically
-(default 600 seconds), with no application data. Respond to native path requests.
+with no application data. Respond to native path requests. Announce intervals are
+local policy and are not negotiated by this protocol.
 
-Clients accept a 16-byte destination hash (32 hex characters in the CLI), discover
-its path/public identity, establish a Link and identify with their persistent client
-identity. The server authorizes the authenticated remote identity hash: the first
+Clients use a 16-byte destination hash, discover its path/public identity,
+establish a Link and identify with their persistent client identity. The server authorizes the authenticated remote identity hash: the first
 16 bytes of SHA-256 of the 64-byte public identity key. This is **not** the client's
-application destination hash. The YAML `permits` list contains single-entry mappings from an identity hash to
-`full`, `read` or `deny`. Evaluate specific address rules in order; the first match
-wins. If there is no specific match, use the first `others` rule regardless of its
-position. With neither a match nor `others`, deny access. `full` admits push and
-pull; `read` admits pull only; `deny` rejects the peer. `others` may grant either
-full or read access to authenticated identities not explicitly listed. Denied or
-unauthenticated peers cannot access the export. The server filters unauthenticated
-application packets and Resource advertisements
-before passing them to the native manager. Ordinary incoming Resources are admitted
-only for the pending push file, with its exact advertised size and no metadata.
-At most 16 inbound Links are admitted. The Rust manager
-uses its synchronous identity gate and checks its authenticated identity map again
-on every application request.
+application destination hash. Authorization is evaluated against that authenticated
+identity. Full access permits push and pull, read access permits pull only, and
+denied or unauthenticated peers cannot access the export. The choice of identities
+and fallback permissions is server-local policy.
+
+Reject unauthorized application packets and Resource advertisements before accepting
+their data. Ordinary incoming Resources are admitted only for the pending push
+file, with its exact advertised size and no metadata. Recheck identity and operation
+authorization on every application request.
 
 ## Control and data carriers
 
@@ -65,13 +39,11 @@ Use standard Reticulum Link requests to path `/rrsync/v1`. Python uses
 The request path hash is Reticulum's truncated SHA-256 of the UTF-8 path. Native
 request IDs and request/response envelopes are supplied by Reticulum; they are not
 part of the binary application payload below. Large requests and responses are
-carried using native request/response Resources automatically. The Rust adapter uses
-`LinkSession::request_with_metadata_limit` and `LinkManager::set_request_handler_ex`.
+carried using native request/response Resources automatically.
 
 File bytes are **ordinary standalone Resources** on the same Link, with no metadata,
-no application framing and automatic compression disabled by the Rust sender. Use
-streaming/file-backed Resource APIs. Receivers must accept valid native compressed
-Resources subject to uncompressed size limits. Native Resource hashes/proofs are
+no application framing. Send with automatic compression disabled. Receivers must
+accept valid native compressed Resources subject to uncompressed size limits. Native Resource hashes/proofs are
 not SHA-256 hashes of the original file; do not substitute one for the other.
 
 No Channel message types, custom packet acknowledgements, packet fragmentation or
@@ -105,9 +77,8 @@ index into the **source manifest**, including directory and protected entries.
 
 START flags: bit 0 = delete, bit 1 = checksum, bit 2 = dry-run. `push` is 1 for
 client-to-server and 0 for server-to-client. All START paths are relative to the
-export root; empty means the export root itself. A CLI leading `/` is removed once
-before encoding. Wire absolute paths, empty internal components, `.`, `..`, NUL and
-components exceeding 255 bytes are invalid.
+export root; empty means the export root itself. Absolute paths, empty internal
+components, `.`, `..`, NUL and components exceeding 255 bytes are invalid.
 
 A manifest is `entry_count:u32`, followed by this many entries:
 
@@ -135,9 +106,9 @@ request/response Resource limits allow 1,024 extra bytes for Reticulum envelopes
 
 Error codes: 1 permission denied, 2 invalid path, 3 changed source/destination,
 4 file hash mismatch, 5 protocol/plan/state error, 6 filesystem error, 7 transport
-error, 8 configuration error, 9 busy export. The Rust server truncates error descriptions to 240
-Unicode characters. Errors abort that Link's application session; earlier committed
-files are not rolled back. Busy errors from other Links leave the active session
+error, 8 configuration error, 9 busy export. Error text is diagnostic; use the
+numeric code for classification. Errors abort that Link's application session;
+earlier committed files are not rolled back. Busy errors from other Links leave the active session
 intact. Callers must fail the session on any ERROR or unexpected response; v2 may
 start a fresh session after busy, under its reconnect policy.
 
@@ -171,8 +142,7 @@ cannot be removed or replaced. Directory mtimes are restored after file operatio
 from deepest to shallowest. Protected-entry mtimes do not participate in comparison.
 
 Dry-run uses START/MANIFEST then FINISH/OK only. Do not create destination roots,
-temporary receive files or persistent identities during dry-run. Native runtime
-startup must also avoid initialization writes by requiring existing local state.
+temporary receive files or other persistent state during dry-run.
 
 ## Push exchange
 
@@ -212,8 +182,6 @@ startup must also avoid initialization writes by requiring existing local state.
 
 Python server implementations must deliver the GET response before starting the
 Resource advertisement. Do not put file bytes in the request response itself.
-The Rust server uses `RequestOutcome::ReplyWithFile`; push uses
-`LinkSession::send_resource_reader`; both receiving roles use file-backed APIs.
 
 ## Failure and recovery
 
@@ -253,26 +221,26 @@ The server also expires sessions after a configurable interval without applicati
 data or Resource traffic, closing the abandoned Link. Keepalives alone do not renew
 a session. After an abrupt client exit, a new run may need to wait for this lease.
 
-Use configurable operation deadlines (default 600 seconds). These are total
-operation deadlines, so very slow links may require longer values. Shared-instance
-reconnection belongs to rsReticulum; it does not resurrect the application session.
+Operation deadlines are local policy and are not exchanged on the wire.
+Reconnecting to the shared Reticulum instance does not restore an application
+session; establish a new authenticated Link and start with START.
 
-Use same-directory staging and atomic rename for regular-file installation. Detect
-source changes with metadata checks before/after snapshotting and after transfer;
-Rust compares inode, device, size, mtime and ctime locally (only size and mtime travel
-in the manifest). This is best-effort detection, not a filesystem-wide snapshot.
+Regular-file installation must atomically replace the destination only after
+validation. Detect source changes before/after snapshotting and after transfer;
+only size and mtime travel in the manifest. Local source-stability checks do not
+provide a filesystem-wide snapshot.
 Directory-to-file type replacement is a verified-file-then-remove operation and
 cannot provide the same atomic guarantee as replacing a regular file. A run is not
 an atomic transaction covering the entire tree.
 
 ## Python callback mapping
 
-The local Python Reticulum implementation exposes these corresponding hooks:
+The following Reticulum API hooks carry the messages and state transitions above:
 
 - `destination.register_request_handler("/rrsync/v1", response_generator=...,
   allow=..., allowed_list=...)`. The generator receives `(path, data, request_id,
   link_id, remote_identity, requested_at)` and returns the encoded response bytes.
-  Apply the ordered permits policy even when a native allow-list is also used.
+  Apply operation authorization even when a native allow-list is also used.
 - `link.set_remote_identified_callback(callback)` receives `(link, identity)`.
   Install authentication and session policy before accepting application traffic.
 - Set `RNS.Link.ACCEPT_APP` and a `link.set_resource_callback(...)` admission
@@ -293,16 +261,10 @@ The local Python Reticulum implementation exposes these corresponding hooks:
   the codec above. Resource callbacks may run on different threads, so serialize
   application state transitions per Link and protect the server export session.
 
-These mappings describe the intended Python port; interoperability with a Python
-rrsync implementation has not yet been tested. The currently validated peers are
-Rust client/server processes attached to the existing rnsd-rs shared instance.
-
 ## Version 2 chunk extension
 
-The Rust client selects v2 with YAML `protocol: 2`, which requires a `resume`
-section containing an explicit `chunk_size`. A server with `resume` configured
-accepts both `/rrsync/v1` and `/rrsync/v2`, irrespective of its outgoing `protocol`
-setting. With no `resume`, v2 requests are rejected. Version 1 remains the default.
+A server may support both versions on the same destination. The client selects
+the version by request path; support for v2 must be enabled at the receiving peer.
 
 V2 uses request path `/rrsync/v2` and header `version:u8 = 2, tag:u8`.
 The destination remains `rrsync.sync`. Version is pinned on the first authenticated
@@ -324,8 +286,7 @@ still 8 MiB and manifest limits, including the 134,217,727-byte whole-file limit
 remain unchanged for this extension. Native Resource segmentation is still owned
 by Reticulum; an application chunk is one ordinary standalone Resource.
 
-The paged format replaces the previous unpaged v2 format in place. Both peers
-must be upgraded; there is no old decoder, negotiation or compatibility fallback.
+Only the paged message layouts below are defined for version 2.
 
 | Tag | Message | Fields after tag |
 | --- | --- | --- |
@@ -348,7 +309,7 @@ in the session. There is no independent 8,192-chunk limit.
 
 DESCRIPTION is only the file header: no chunk count or table follows its hash.
 Derive `chunk_count = ceil(size / chunk_size)`. `chunk_size` is 4,096–16,777,216
-bytes, explicitly configured, and `size` must not exceed 134,217,727. Thus even
+bytes, and `size` must not exceed 134,217,727. Thus even
 4 KiB chunks support the full current file limit (32,768 chunks). All chunks except
 the last have exactly `chunk_size` bytes; the last holds the remainder or a full
 chunk when division is exact. Empty files have zero chunks and SHA-256(empty).
@@ -365,13 +326,9 @@ indices are strictly increasing, unique and inside `[start, start + page_count)`
 empty means that entire page is already cached. MISSING is at most 530 bytes.
 No empty hash pages are sent, including for empty files.
 
-The Rust source computes SHA-256 with a fixed buffer and streams chunk hashes to
-an anonymous temporary file. Receivers write negotiated pages to their own anonymous
-hash table. At most one page of hashes/missing indices and one pending Resource
-are needed in memory. Completed page state is discarded; the disk hash table is
-used again during final validation. It costs 32 bytes per chunk (at most 1 MiB with
-the current limits) and is not persistent resume evidence. Python implementations
-can use the same approach; do not accumulate all pages in a list or set.
+Each negotiated page contains at most 128 hashes. The complete set of negotiated
+hashes must remain available for final content validation; their local storage
+representation is not part of the protocol.
 
 ### V2 transfer ordering
 
@@ -387,7 +344,7 @@ For push:
 3. For each missing index, send CHUNK_BEGIN, wait for OK, send the exact bytes as
    one Resource without metadata, then send CHUNK_COMMIT with its native Resource
    hash. The server binds the receipt to that pending chunk, verifies size/SHA-256,
-   publishes and fsyncs the payload before OK. Resource proof alone is insufficient.
+   durably publishes the payload before OK. Resource proof alone is insufficient.
 4. Finish every missing chunk before the next HASHES. After all pages, check the
    source and send FILE_COMMIT. The server revalidates all chunks, assembles and
    verifies the whole hash, installs the file, then replies OK. Early FILE_COMMIT
@@ -396,7 +353,7 @@ For push:
 For pull:
 
 1. Send DESCRIBE with the chunk size. The server snapshots the source and returns
-   DESCRIPTION, retaining the snapshot and its disk hash table. Validate the header
+   DESCRIPTION, retaining the snapshot and its chunk hashes. Validate the header
    and open local scoped receiver state.
 2. Send HASHES_GET for the next page. Validate the HASHES response's index, start
    and exact count; store its hashes and rehash local chunks in that page.
@@ -422,26 +379,19 @@ fresh descriptions. The receiver reports only cached chunks that pass size/hash
 checks. Do not persist/replay pending Resource receipts or session commands.
 Changed identities, paths, source bytes or chunk sizes must not accidentally reuse
 another transfer's state. A lost chunk or file acknowledgement is resolved by
-fresh negotiation, not blind mutation replay. Receiver-state configuration and quotas
-are described below, including expiry of inactive receiver state.
+fresh negotiation, not blind mutation replay. Requirements for reusable receiver
+state are specified below.
 
 ### Automatic session reconnect
 
-The optional top-level `reconnect` policy is client-local and requires outgoing
-protocol 2. `attempts` is the number of additional sessions (default 0, maximum 32).
-`delay_seconds` defaults to 5; double the delay after each failure, capped by
-`max_delay_seconds` (default 60). Delays must be positive, with initial <= maximum
-and maximum <= 86400 seconds. `max_elapsed_seconds` defaults to 3600, must be
-1–604800, and covers the initial attempt, waits and retries when enabled. This is
-a cooperative asynchronous deadline; synchronous filesystem work is not preempted.
-
-Retry connection loss, discovery/operation timeouts, exhausted native Resource
-sender retries and ERROR code 9 (busy). Other remote codes, explicit access denial,
-invalid Link proofs, protocol/hash/source-change errors and local I/O/config/cache
-failures are terminal. Preserve numeric remote codes; do not classify human error
-text. A peer that reports busy using legacy code 5 is treated as terminal. Native
-Link closure may not reveal its reason, so indistinguishable closures consume the
-bounded retry budget even if the peer rejected authentication.
+Automatic retries are optional local policy; no reconnect command or retry
+schedule is negotiated. Connection loss, discovery/operation timeouts, exhausted
+native Resource retries and ERROR code 9 (busy) may be handled by starting a new
+session. Other remote error codes, explicit access denial, invalid Link proofs,
+protocol/hash/source-change errors and local failures terminate the operation.
+Use numeric ERROR codes, not diagnostic text, for this decision. If a Link closes
+without revealing a reason, any retry must still perform fresh authentication
+and authorization.
 
 Every attempt reopens the local root, rescans it, rediscovers/verifies the remote
 identity, opens a new Link, identifies, and starts fresh negotiation with START.
@@ -451,12 +401,11 @@ blocks across failures. A lost FILE_COMMIT or FINISH acknowledgement is resolved
 by this comparison of actual state. An exhausted deadline is not evidence that
 the last mutation failed; a later invocation must also rescan.
 
-Retain one Reticulum client runtime across attempts; this policy does not restart
-the daemon. On cancellation, release local pending files/cache locks. Abrupt Link
-deregistration may leave the server busy until its inactivity lease expires.
+On cancellation, release the local pending transfer state. Abrupt Link closure
+may leave the server busy until its inactivity lease expires.
 
-The engine receives authenticated peer identity and current permission from its
-adapter on every request. An identity change or revoked write permission aborts
+Each request must be associated with its authenticated peer identity and current
+permission. An identity change or revoked write permission aborts
 the owning session. Requests from another connection cannot release the active
 session. One described file and one pending chunk are allowed; repeated BEGIN,
 COMMIT or verification commands in the wrong state are rejected. File completion
@@ -464,11 +413,10 @@ cannot proceed while a chunk is pending; push additionally requires all missing
 chunks to have been persisted. Pull permits FILE_VERIFIED without CHUNK_GET when
 the receiver already has every chunk in its verified cache.
 
-An error or disconnect releases pending files and cache locks while preserving
-committed chunks. Lost close notifications rely on the inactivity lease; native
-traffic should refresh it as in v1. Successful installation triggers best-effort
-chunk eviction. Eviction failure is logged and does not undo file installation or
-turn its acknowledgement into a failure. Empty cache lock directories remain.
+An error or disconnect releases pending session state while preserving committed
+chunks for resume. Lost close notifications rely on the inactivity lease; native
+traffic refreshes it as in v1. After successful installation, local cache cleanup
+must not undo the installed file or invalidate its acknowledgement.
 
 ### Application control cost per described file
 
@@ -487,92 +435,28 @@ payload bytes are separate. These are application-codec sizes, not measured radi
 traffic or a latency prediction. K=0 describes a complete cache for a file still
 requiring installation; an unchanged installed file is normally skipped by planning.
 
-### Receiver cache policy
+### Reusable receiver state
 
-Rust `resume.directory` defaults to `transfers` relative to the app configuration
-directory. Resolve the root and cache to absolute paths and reject overlap before
-connecting/serving. Create state lazily on a real receive, outside the sync tree.
-Dry-run must not create a cache or acquire persistent cache locks.
+Cached chunks are local state, not a shared storage format. Bind reusable data to
+the authenticated peer, transfer direction, target root/path, file size, chunk size
+and whole-file hash. Reauthenticate and negotiate a fresh description and hash
+pages for each new session. A quota reservation, receipt journal or stored bitmap
+alone is not evidence of valid data.
 
-The default limits are `max_bytes: 536870912` and `max_transfers: 128`. Under an
-exclusive cache-wide lock, count existing payload/staging bytes and reserve the
-space needed for absent/wrong-size chunks before accepting new data. Existing
-bytes are counted even if later hash checks require replacement. Hash validation
-happens when each page arrives; quotas never imply cache validity. Reject quota violations
-without deleting another transfer's data. An additional per-transfer lock protects
-the individual description. Hold both until file completion or session teardown;
-process termination releases them. The byte limit excludes native Resource and
-assembly/snapshot/hash-table temporary storage, lock/activity records and filesystem allocation overhead.
+Before reporting a chunk as present in MISSING, verify its exact length and SHA-256
+against the freshly negotiated page. Otherwise report it as missing. Preserve the
+chunk publication and acknowledgement ordering specified above; native delivery
+proof alone is not a durable application receipt. Before file installation, verify
+all chunks and the assembled whole-file hash.
 
-Directory-count limits include retained empty lock directories. Successful file
-installation evicts its chunks. `resume.retention_seconds` defaults to 604800;
-zero disables expiry. Before opening a receiving transfer and checking quotas,
-remove other expired transfer directories, including chunks, abandoned staging,
-activity and lock files. Never expire the currently requested description: rehash
-its chunks and resume. No background sweep is performed; idle caches and dry-run
-are unchanged. Cache expiry changes no wire fields and requires no peer support.
-
-All storage users must acquire `cache.lock` before opening a transfer directory:
-limited/adapter users take an exclusive nonblocking flock for their entire lifetime;
-unrestricted library stores take a shared nonblocking flock, also for their entire
-lifetime. Then acquire the per-transfer exclusive nonblocking `lock`. Hold the
-cache lock until after releasing the transfer lock. Cleanup owns the exclusive
-cache lock and each candidate transfer lock. Only under that exclusion may it
-unlink a transfer lock and remove its directory. Never unlink `cache.lock`.
-Stop all old processes before upgrading from implementations that do not follow
-this locking order. Unknown objects or unsafe paths fail cleanup of the affected
-transfer without deleting any of its contents; no symlinks are followed.
-
-The Rust local activity record is `activity`: exactly 16 bytes, ASCII `RRSYNC01`
-followed by an unsigned big-endian u64 Unix timestamp in seconds. Write through
-same-directory staging, fsync, atomic rename and directory fsync, without setting
-mtime. Refresh on opening the store, after successful chunk publication, on clear,
-and best-effort on normal close/error unwinding while both locks are still held.
-On open, always publish the current timestamp. During that store's lifetime,
-serialize timestamp sampling and publication; skip the write only when the sampled
-second equals its last successfully published timestamp. A failed publication
-must not update this remembered value; a changed second, including clock rollback,
-requires a new durable publication. This avoids rewriting identical records without
-changing retention precision or the chunk fsync/rename/directory-fsync ACK boundary.
-A killed process retains its last published timestamp. Activity records do not
-prove chunk validity; always rehash chunks. No filesystem timestamp is used for
-validation or retention, so this works on VFAT without precise timestamp support.
-
-While sweeping, a missing or malformed activity record is initialized to the current
-time and granted a full retention period (including legacy caches). Retain future
-timestamps after clock rollback. Expire when `now >= last` and `now - last >=
-retention_seconds`. A forward clock jump can evict inactive state early; content
-must then be retransferred. Before deletion validate all entries in that transfer:
-regular `lock`/`activity`, `.rrsync-` staging files, and eight-hex-digit shard
-directories only. Shard `hex8(chunk_index / 256)` contains `hex8(chunk_index).chunk`
-and staging files; verify each chunk belongs to that shard. Validate one directory
-at a time, without collecting all chunk paths. Delete shard payload/staging and
-empty shards first, activity next, lock last, then the empty
-directory. Within a shard, unlink payload/staging files as one batch and fsync
-that directory once before removing the empty shard. Sync its parent after the
-shard removal. Root-level staging files are also removed as a batch followed by
-a root directory fsync. Activity/lock removals and the final transfer-directory
-removal retain their individual parent-directory syncs. Attempt the batch fsync
-even after a failed unlink so earlier successful removals are flushed; propagate
-any failure and do not advance cleanup to removing that shard. Neither a failed
-unlink nor a failed fsync may report successful cleanup. Locks remain held during
-these operations. This changes only cache eviction, not chunk publication, receipt
-acknowledgement or destination installation durability.
-
-Interrupted cleanup is safe to revisit; if the
-activity record was already removed, grant a new retention period. Manual cleanup
-still requires all cache users to be stopped.
-
-Transfer directories are keyed by SHA-256 of `rrsync-local-chunks-paged\0`, the
-32-byte scope digest, size:u64, chunk_size:u32 and whole_sha256 (big-endian fields).
-The per-chunk hash table is freshly negotiated and is not part of this key. Chunks
-are rehashed against it before reuse. Flat cache layout is unsupported: stop users
-and clear old state before upgrading. There is no migration implementation.
+Cache eviction or loss may cause retransmission, but must not allow unverified
+bytes to be reused or change file-commit semantics. Storage layout, cache keys,
+locking primitives, quotas and expiry scheduling are implementation-local and are
+not exchanged or negotiated. The peers do not need to share a cache format.
 
 ### Fixed v2 encoding examples
 
-These examples are also checked by `tests/protocol_v2.rs`. Spaces/newlines below
-are for readability and are not transmitted.
+Spaces/newlines below are for readability and are not transmitted.
 
 ```text
 DESCRIBE(index=7, chunk_size=4096):
