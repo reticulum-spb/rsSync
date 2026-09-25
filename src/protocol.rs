@@ -1,4 +1,5 @@
 //! Language-independent, bounded big-endian codec. See SUMMARY.md for the wire specification.
+pub mod v2;
 use crate::{
     Error, Result,
     sync::{Entry, Kind, MAX_ENTRIES, Manifest, Options},
