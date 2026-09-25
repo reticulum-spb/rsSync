@@ -1,0 +1,24 @@
+[package]
+name = "rrsync"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+
+[dependencies]
+rns-runtime = { path = "../rsReticulum/crates/rns-runtime", default-features = false, features = ["client"] }
+rns-identity = { path = "../rsReticulum/crates/rns-identity" }
+rns-crypto = { path = "../rsReticulum/crates/rns-crypto", features = ["std"] }
+rns-protocol = { path = "../rsReticulum/crates/rns-protocol" }
+rns-wire = { path = "../rsReticulum/crates/rns-wire", features = ["std"] }
+rns-transport = { path = "../rsReticulum/crates/rns-transport" }
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde-saphyr = { version = "1", default-features = false, features = ["deserialize", "serialize"] }
+sha2 = "0.10"
+hex = "0.4"
+rustix = { version = "1", features = ["fs"] }
+tempfile = "3"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

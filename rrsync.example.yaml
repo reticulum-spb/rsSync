@@ -1,0 +1,13 @@
+# Save as config.yaml inside the directory selected by --config (default ~/.rsSync).
+# The persistent private key is stored beside it as identity.
+
+# Omit to use the existing rnsd-rs default configuration directory.
+# reticulum_config: /home/user/.rsReticulum
+
+timeout_seconds: 600
+announce_seconds: 600
+
+permits:
+  # - "0123456789abcdef0123456789abcdef": full
+  # - "fedcba9876543210fedcba9876543210": read
+  - others: deny
