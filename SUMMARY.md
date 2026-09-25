@@ -457,6 +457,23 @@ traffic should refresh it as in v1. Successful installation triggers best-effort
 chunk eviction. Eviction failure is logged and does not undo file installation or
 turn its acknowledgement into a failure. Empty cache lock directories remain.
 
+### Application control cost per described file
+
+Let N be the chunk count, P = ceil(N / 128), and K the count actually transferred
+after cached chunks are checked. Summing the current encoded messages in both
+directions (including OK responses) gives:
+
+- Push: `60 + 32*P + 32*N + 60*K` bytes.
+- Pull: `68 + 24*P + 32*N + 24*K` bytes.
+- Either direction: `2 + P + 2*K` request/response exchanges.
+
+This covers DESCRIPTION/DESCRIBE, all hash/missing pages, chunk commands and final
+file verification. It excludes START/MANIFEST/FINISH, Link setup/identification,
+Resource framing/proofs, encryption, transport headers and retransmissions. File
+payload bytes are separate. These are application-codec sizes, not measured radio
+traffic or a latency prediction. K=0 describes a complete cache for a file still
+requiring installation; an unchanged installed file is normally skipped by planning.
+
 ### Receiver cache policy
 
 Rust `resume.directory` defaults to `transfers` relative to the app configuration

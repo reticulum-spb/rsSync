@@ -114,7 +114,10 @@ missing chunk counts per page. Hashes and missing indices are negotiated in page
 of at most 128 chunks; the full hash table is kept in an anonymous temporary file,
 not an in-memory vector. Each cache subdirectory holds at most 256 chunk payloads.
 Smaller chunks reduce retransmission after interruption but increase hashing,
-control exchanges and disk operations. Delta transfer is not implemented.
+control exchanges and disk operations. Each missing chunk requires two application
+request/response exchanges; even cached pages exchange hashes for verification.
+Chunk publication and cache cleanup synchronize changes to storage, so many small
+chunks can also increase local disk latency. Delta transfer is not implemented.
 
 Both peers must use the current paged v2 format. There is no unpaged-v2 fallback
 or old-cache migration. Stop cache users and clear the old `resume.directory`
