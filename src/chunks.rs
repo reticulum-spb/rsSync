@@ -445,18 +445,25 @@ fn payload_bytes(root: &Root) -> Result<u64> {
     Ok(bytes)
 }
 fn remove_payload(root: &Root) -> Result<()> {
+    let mut staging = Vec::new();
     for (name, meta) in root.children("")? {
         if name == "lock" || name == "activity" {
             continue;
         }
         if meta.is_dir() {
-            for (child, _) in root.children(&name)? {
-                root.remove(&format!("{name}/{child}"), false)?;
-            }
+            let children = root
+                .children(&name)?
+                .into_iter()
+                .map(|(child, _)| child)
+                .collect::<Vec<_>>();
+            root.remove_files(&name, &children)?;
             root.remove(&name, true)?;
         } else {
-            root.remove(&name, false)?;
+            staging.push(name);
         }
+    }
+    if !staging.is_empty() {
+        root.remove_files("", &staging)?;
     }
     Ok(())
 }

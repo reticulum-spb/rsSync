@@ -218,6 +218,22 @@ impl Root {
         dir.sync_all()?;
         Ok(())
     }
+    /// Cache-only batch removal under the caller's state locks. Sync this
+    /// directory before reporting success, including after a partial failure.
+    pub(crate) fn remove_files(&self, path: &str, names: &[String]) -> Result<()> {
+        for name in names {
+            validate(name)?;
+            if name.contains('/') {
+                return Err(Error::InvalidPath(name.clone()));
+            }
+        }
+        let dir = self.open_full(&self.full(path)?, OFlags::RDONLY | OFlags::DIRECTORY)?;
+        unlink_batch(
+            names,
+            |name| Ok(rx::unlinkat(&dir, name, AtFlags::empty())?),
+            || Ok(dir.sync_all()?),
+        )
+    }
     pub fn set_mtime(&self, path: &str, sec: i64, ns: u32) -> Result<()> {
         let f = self.open_full(&self.full(path)?, OFlags::RDONLY | OFlags::NONBLOCK)?;
         set_mtime(&f, sec, ns)
@@ -301,6 +317,19 @@ impl Root {
         Ok(staged)
     }
 }
+
+fn unlink_batch(
+    names: &[String],
+    mut unlink: impl FnMut(&str) -> Result<()>,
+    sync: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let removed = names.iter().try_for_each(|name| unlink(name));
+    // Do not short-circuit the sync after a failed unlink: earlier removals
+    // may have succeeded. An unsuccessful sync must never become success.
+    let synced = sync();
+    removed.and(synced)
+}
+
 pub struct Staged {
     dir: File,
     name: String,
@@ -395,4 +424,70 @@ pub fn snapshot(root: &Root, path: &str, expected: &Stamp) -> Result<File> {
     }
     tmp.rewind()?;
     Ok(tmp)
+}
+
+#[cfg(test)]
+mod batch_tests {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[test]
+    fn batch_syncs_once_and_propagates_unlink_or_sync_failures() {
+        for fail_unlink in [false, true] {
+            for fail_sync in [false, true] {
+                let events = RefCell::new(Vec::new());
+                let result = unlink_batch(
+                    &["a".into(), "b".into(), "c".into()],
+                    |name| {
+                        events.borrow_mut().push(name.to_string());
+                        if fail_unlink && name == "b" {
+                            Err(std::io::Error::other("unlink failure").into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    || {
+                        events.borrow_mut().push("sync".into());
+                        if fail_sync {
+                            Err(std::io::Error::other("sync failure").into())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                );
+                assert_eq!(result.is_err(), fail_unlink || fail_sync);
+                assert_eq!(
+                    events.into_inner(),
+                    if fail_unlink {
+                        vec!["a", "b", "sync"]
+                    } else {
+                        vec!["a", "b", "c", "sync"]
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn failed_batch_preserves_later_files_and_can_be_retried() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("a"), b"a").unwrap();
+        std::fs::write(temp.path().join("c"), b"c").unwrap();
+        std::fs::create_dir(temp.path().join("b")).unwrap();
+        let root = Root::open(temp.path()).unwrap();
+        assert!(
+            root.remove_files("", &["a".into(), "b".into(), "c".into()])
+                .is_err()
+        );
+        assert!(!temp.path().join("a").exists());
+        assert!(temp.path().join("b").is_dir());
+        assert!(temp.path().join("c").is_file());
+        assert!(
+            root.remove_files("", &["c".into(), "../outside".into()])
+                .is_err()
+        );
+        assert!(temp.path().join("c").is_file());
+        root.remove_files("", &["c".into()]).unwrap();
+        assert!(!temp.path().join("c").exists());
+    }
 }

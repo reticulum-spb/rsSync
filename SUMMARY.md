@@ -529,7 +529,18 @@ directories only. Shard `hex8(chunk_index / 256)` contains `hex8(chunk_index).ch
 and staging files; verify each chunk belongs to that shard. Validate one directory
 at a time, without collecting all chunk paths. Delete shard payload/staging and
 empty shards first, activity next, lock last, then the empty
-directory, syncing each removal. Interrupted cleanup is safe to revisit; if the
+directory. Within a shard, unlink payload/staging files as one batch and fsync
+that directory once before removing the empty shard. Sync its parent after the
+shard removal. Root-level staging files are also removed as a batch followed by
+a root directory fsync. Activity/lock removals and the final transfer-directory
+removal retain their individual parent-directory syncs. Attempt the batch fsync
+even after a failed unlink so earlier successful removals are flushed; propagate
+any failure and do not advance cleanup to removing that shard. Neither a failed
+unlink nor a failed fsync may report successful cleanup. Locks remain held during
+these operations. This changes only cache eviction, not chunk publication, receipt
+acknowledgement or destination installation durability.
+
+Interrupted cleanup is safe to revisit; if the
 activity record was already removed, grant a new retention period. Manual cleanup
 still requires all cache users to be stopped.
 

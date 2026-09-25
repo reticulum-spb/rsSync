@@ -169,7 +169,9 @@ clear and normal close. It does not depend on filesystem timestamps, including o
 VFAT. Missing or malformed records get a full retention period on discovery;
 future timestamps are retained until the clock catches up. A forward clock jump
 can expire inactive cache early, requiring those bytes to be transferred again.
-Active stores are protected by cache and transfer locks. Unexpected objects stop
+Active stores are protected by cache and transfer locks. Cleanup batches removals
+within each cache subdirectory and synchronizes the group before proceeding.
+Unexpected objects stop
 cleanup of the affected transfer.
 
 Stop all cache users before upgrading from versions without this locking scheme.
