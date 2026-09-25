@@ -143,7 +143,10 @@ Received files are verified in temporary storage before installation. Replacing 
 regular file is atomic. An interrupted transfer leaves the previous file intact.
 A failed run may have installed earlier files; rerunning skips completed unchanged
 files and retransmits the unfinished file. After an abrupt client exit, wait for
-the server inactivity timeout before retrying. Source changes detected during a run
+the server inactivity timeout before retrying. If a commit or final response is
+lost, the receiving side may already have completed that operation. Rerun the
+synchronization to compare actual directory contents; commands are not automatically
+replayed after an uncertain result. Source changes detected during a run
 cause failure. Chunk resume, delta transfer and automatic session reconnection are
 not implemented.
 

@@ -204,7 +204,19 @@ The Rust server uses `RequestOutcome::ReplyWithFile`; push uses
 Close the Link on completion or failure. A closed Link releases server session and
 pending receive state. A timeout or lost final response is not proof that a commit
 failed: reconnect and rescan instead of blindly replaying mutations. Repeating a
-run is the MVP recovery mechanism. Native Resource segmentation is not persistent
+run is the MVP recovery mechanism. Never retry COMMIT or FINISH blindly on the
+same Link after a timeout. A lost COMMIT response may mean the file is already
+installed; a lost FINISH response during push may mean deletion has completed.
+During pull, the client must retain extras until it receives FINISH/OK. A new
+session compares current manifests and skips files already installed.
+
+Protocol errors abort only the offending connection's session. Out-of-order or
+repeated mutation commands are rejected; a busy request from a different Link
+must not release the active export session. Discard file completions from another
+connection or without a matching pending upload. Dropping an application task
+without closing its Link relies on the server inactivity lease for cleanup.
+
+Native Resource segmentation is not persistent
 chunk resume. No offsets, application chunk IDs, delta hashes or resume requests
 are defined by v1.
 
